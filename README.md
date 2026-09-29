@@ -43,7 +43,9 @@ plugin is: a platform, a sender, and no way in.
 
 - `instance` labels which Hermes spoke, so one Familiar serving several instances can say so.
 - `target` is the delivery the job asked for, `default` being the instance's own inbox.
-- `truncated` is true when the message was longer than the plugin's 60 kB cap.
+- `truncated` is true when the message was longer than the plugin's 20 000-character cap, which is the same cap
+  Familiar enforces on its side: it refuses a longer delivery rather than trimming it, so anything over the cap
+  has to be cut here or it does not arrive.
 - `jobId` is the scheduled job's id when a cron delivery produced it, otherwise null.
 - A 2xx answer should carry `{"id": "..."}`; the plugin stores it as the delivery's message id. An empty body
   is accepted, and the id is then absent rather than invented.

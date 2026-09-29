@@ -175,9 +175,13 @@ check(
     str(RECEIVED[-1]["json"]["target"]),
 )
 
-long_text = "x" * 70_000
+long_text = "x" * 30_000
 send(live, content=long_text)
-check("a long brief is cut at the cap, not sent as a burst", len(RECEIVED[-1]["json"]["content"]) == 60_000, str(len(RECEIVED[-1]["json"]["content"])))
+check(
+    "a long brief is cut at the cap the receiving end enforces, not sent as a burst",
+    len(RECEIVED[-1]["json"]["content"]) == 20_000,
+    str(len(RECEIVED[-1]["json"]["content"])),
+)
 check("and says so", RECEIVED[-1]["json"]["truncated"] is True)
 
 # 4. Failures.

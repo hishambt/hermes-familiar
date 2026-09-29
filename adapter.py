@@ -46,12 +46,16 @@ DEFAULT_URL = "http://127.0.0.1:3100"
 DEFAULT_TARGET = "default"
 NOTIFY_PATH = "/api/hermes/notifications"
 
-"""What one delivery carries before it is cut.
-
-Well under the 100 kB JSON body a default Express parser accepts, and far more than a job's brief needs.
-Familiar keeps what it is sent; the instance keeps the full output in its own cron journal.
 """
-MAX_MESSAGE_LENGTH = 60_000
+What one delivery carries before it is cut.
+
+Familiar caps a delivery at the same 20 000 characters and REFUSES more rather than trimming it, so a message
+longer than this has to be cut here or it does not arrive at all. The cap is in characters on both sides and
+sits well under the 100 kB JSON body a default Express parser accepts: 20 000 characters is at most 80 kB in
+UTF-8, so the same text fits whatever it is written in. Familiar keeps what it is sent; the instance keeps the
+whole output in its own cron journal.
+"""
+MAX_MESSAGE_LENGTH = 20_000
 TIMEOUT_SECONDS = 15.0
 
 
