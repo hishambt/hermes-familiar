@@ -94,12 +94,31 @@ def _instance_name(extra: Dict[str, Any]) -> str:
     return _setting(extra, "instance", "FAMILIAR_INSTANCE") or _default_instance_name()
 
 
+def _job_name(job_id: str) -> Optional[str]:
+    """The job's own name, when this process can see the cron store.
+
+    Best effort on purpose: a delivery must not fail because a name could not be read, and the id is already in
+    the payload for a client that wants to resolve the name itself. A gateway delivers through this plugin, so
+    the store is the same one the scheduler just read.
+    """
+    try:
+        from cron.jobs import get_job
+
+        return (get_job(job_id) or {}).get("name") or None
+    except Exception:
+        logger.debug("[familiar] could not read the name of job %s", job_id, exc_info=True)
+        return None
+
+
 def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """What Familiar receives: the notification, not the job.
 
     ``jobId`` is filled on a cron delivery because the scheduler puts it in the route metadata
     (``cron/scheduler_delivery.py`` -> ``_live_route_metadata``). A ``send_message`` call carries no job, so
     the field is null rather than absent - a client shows "not from a job" and "job unknown" differently.
+
+    ``jobName`` rides with it because that is what a reader recognizes in a notification list; the id stays for
+    anything that has to act on the job.
     """
     job_id = (metadata or {}).get("job_id")
     truncated = len(content) > MAX_MESSAGE_LENGTH
@@ -112,6 +131,7 @@ def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[s
         "content": content[:MAX_MESSAGE_LENGTH],
         "truncated": truncated,
         "jobId": str(job_id) if job_id else None,
+        "jobName": _job_name(str(job_id)) if job_id else None,
         "sentAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
 

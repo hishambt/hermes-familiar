@@ -96,6 +96,12 @@ def send(adapter_obj, chat_id="default", content="Job output here", metadata=Non
 
 print(f"stub receiver on {URL}\n")
 
+# A real job in this run's cron store, so the name lookup is exercised against the same API a gateway uses.
+# HERMES_HOME already points at a temp directory, so nothing here reads or writes the real one.
+from cron.jobs import create_job  # noqa: E402
+
+JOB_ID = create_job(prompt="probe", schedule="0 4 * * *", name="Delivery probe")["id"]
+
 # 1. Registration: what Hermes reads off the entry.
 print("registration")
 class Ctx:
@@ -151,7 +157,7 @@ with without_env("FAMILIAR_TOKEN"):
 
 # 3. A delivery, and what the receiver sees.
 print("\ndelivery")
-result = send(live, metadata={"job_id": "02c072f93038"})
+result = send(live, metadata={"job_id": JOB_ID})
 check("reports success", result.success is True, str(result.error))
 check("keeps the id Familiar returned", result.message_id == "notif_1", str(result.message_id))
 check("posts to the documented path", RECEIVED[-1]["path"] == "/api/hermes/notifications", RECEIVED[-1]["path"])
@@ -160,7 +166,12 @@ payload = RECEIVED[-1]["json"]
 check("instance", payload["instance"] == "homelab", str(payload))
 check("target", payload["target"] == "default", str(payload))
 check("content", payload["content"] == "Job output here", str(payload))
-check("jobId rides from the route metadata", payload["jobId"] == "02c072f93038", str(payload))
+check("jobId rides from the route metadata", payload["jobId"] == str(JOB_ID), str(payload))
+check(
+    "jobName is looked up and sent, so a client can title the notification with it",
+    payload["jobName"] == "Delivery probe",
+    str(payload.get("jobName")),
+)
 check("truncated is false for a short brief", payload["truncated"] is False, str(payload))
 check("sentAt is an ISO instant", payload["sentAt"].endswith("+00:00") and "T" in payload["sentAt"], str(payload["sentAt"]))
 

@@ -37,6 +37,7 @@ plugin is: a platform, a sender, and no way in.
   "content": "Daily payment reminder: 3 invoices are past due.",
   "truncated": false,
   "jobId": "02c072f93038",
+  "jobName": "Daily payment reminder",
   "sentAt": "2026-09-29T15:22:44+00:00"
 }
 ```
@@ -46,7 +47,10 @@ plugin is: a platform, a sender, and no way in.
 - `truncated` is true when the message was longer than the plugin's 20 000-character cap, which is the same cap
   Familiar enforces on its side: it refuses a longer delivery rather than trimming it, so anything over the cap
   has to be cut here or it does not arrive.
-- `jobId` is the scheduled job's id when a cron delivery produced it, otherwise null.
+- `jobId` is the scheduled job's id when a cron delivery produced it, otherwise null, and `jobName` is that
+  job's own name when this process can read the cron store. The name is what a reader recognizes, so a client
+  can title the notification with it; the id is what anything acting on the job uses, and it is what stays
+  when the name cannot be read.
 - A 2xx answer should carry `{"id": "..."}`; the plugin stores it as the delivery's message id. An empty body
   is accepted, and the id is then absent rather than invented.
 - Any non-2xx is a failed delivery. **401 and 403 are treated as permanent** (a refused token will not fix
