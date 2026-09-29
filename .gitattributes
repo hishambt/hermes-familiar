@@ -1,0 +1,9 @@
+# This repo is LF, on every platform, deliberately.
+#
+# A plugin is read by Python wherever it lands, and a git checkout that adds carriage returns turns a
+# one-line change into a whole-file diff on the next commit. Pinning it here is cheaper than diagnosing it.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.ico binary
