@@ -17,10 +17,11 @@ description: >
   Standard library only. Settings live in config.yaml (platforms.familiar.extra) with FAMILIAR_* env vars
   as the fallback.
 author: Hisham Buteen
-license: MIT
-homepage: https://github.com/hishambt/hermes-familiar-notify
-tags: [gateway, platform, notifications, cron]
-manifest_version: 2
+# No manifest_version, so this is a v1 manifest: the format every Hermes reads. v2 is documented in the
+# install's own docs, and this build's `hermes plugins install` refuses a plugin that declares it ("requires
+# manifest_version 2, but this installer only supports up to 1") - so a v2 declaration makes the plugin
+# impossible to install for the very person it is for. `license`/`homepage`/`tags` are v2 fields too, and a
+# field the loader does not know is ignored at best; they live in the README instead.
 # Declared as optional, never required: `requires_env` makes `hermes plugins install` prompt, and the
 # install this plugin is designed for runs from a console whose commands cannot answer a prompt. The token
 # is set afterwards with `config set FAMILIAR_TOKEN=...` (the _TOKEN suffix is what routes it to .env).
