@@ -391,6 +391,14 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 		text = str(payload.get("text") or "").strip()
 		chat_id = str(payload.get("channel") or payload.get("chatId") or self._home or DEFAULT_TARGET)
+
+		# Something about the conversation rather than something said in it - a setting Familiar changed, which the
+		# instance has to be told. It is not a turn, so it does not become one.
+		if str(payload.get("action") or "").strip():
+			await self._apply_action(payload, chat_id)
+
+			return web.json_response({"ok": True})
+
 		if not text:
 			return web.json_response({"error": "missing text"}, status=400)
 
@@ -571,6 +579,48 @@ class FamiliarAdapter(BasePlatformAdapter):
 			return SendResult(success=False, error=str(error), retryable=error.retryable)
 
 		return SendResult(success=True, message_id=str(confirm_id) or None)
+
+	async def _apply_action(self, payload: Dict[str, Any], chat_id: str) -> None:
+		"""Apply a setting Familiar changed, without it becoming something said in the conversation.
+
+		Only one action so far: which model a conversation runs on. It is set as the CHAT key's override rather than
+		against the session id, and that is the whole point - the override is keyed by the conversation, so it
+		survives ``/new``, ``/reset`` and a compression rotation, and a model chosen for a topic is still the model
+		when that topic starts a fresh session.
+		"""
+		action = str(payload.get("action") or "").strip()
+
+		if action != "model":
+			logger.warning("[%s] ignoring an action it does not know: %s", self.name, action)
+
+			return
+
+		store = getattr(self, "_session_store", None)
+
+		if store is None:
+			logger.warning("[%s] no session store, so a model cannot be set here", self.name)
+
+			return
+
+		key = self._session_keys.get(str(chat_id))
+
+		if not key:
+			# Nothing has been said here yet, so the key is minted the way the first message would have minted it.
+			try:
+				source = self.build_source(
+					chat_id=str(chat_id), chat_name=str(chat_id), chat_type="dm",
+					user_id="familiar", user_name="Familiar")
+				key = store.get_or_create_session(source).session_key
+				self._session_keys[str(chat_id)] = key
+			except Exception as error:  # noqa: BLE001 - a setting that cannot land is worth a warning, not a crash
+				logger.warning("[%s] could not resolve the conversation for a model: %s", self.name, error)
+
+				return
+
+		model = str(payload.get("model") or "").strip()
+		# None clears it, which is how a conversation goes back to the instance's own default.
+		store.set_model_override(key, {"model": model} if model else None)
+		logger.info("[%s] model for %s is now %s", self.name, chat_id, model or "(the instance's default)")
 
 	async def _resolve_confirm(self, text: str, chat_id: str) -> None:
 		"""Resolve the confirmation the reader answered, and say what happened either way.

@@ -214,6 +214,7 @@ class _FakeStore:
     def __init__(self):
         self.current = "20261005_120000_abcdef12"
         self.switched_to = []
+        self.models = []
 
     def get_or_create_session(self, source):
         return _FakeEntry("agent:main:familiar:dm:" + str(source.chat_id), self.current)
@@ -225,6 +226,10 @@ class _FakeStore:
 
     def peek_session_id(self, key):
         return self.current
+
+    def set_model_override(self, key, override):
+        self.models.append((key, override))
+        return None
 
 
 store = _FakeStore()
@@ -244,6 +249,55 @@ check("a declared session is adopted, which is how a fork is carried on",
 check("by pointing the key at it, the move /resume makes", store.switched_to == ["20261005_090000_forked01"])
 asyncio.run(live._resolve_session(source, declared="20261005_090000_forked01"))
 check("and one already on the key is left alone", store.switched_to == ["20261005_090000_forked01"])
+
+# 4b. What Familiar changes about a conversation, which is a setting and not something said.
+print("\nsettings the app pushes")
+
+
+class _FakeRequest:
+    """Enough of an aiohttp request for the ingress: a bearer header and a JSON body."""
+
+    def __init__(self, payload, token="tok_abc123"):
+        self.headers = {"Authorization": f"Bearer {token}"}
+        self._payload = payload
+
+    async def json(self):
+        return self._payload
+
+
+def _no_turn(*_args, **_kwargs):
+    raise AssertionError("a setting became a turn")
+
+
+live._message_handler = _no_turn
+accepted = asyncio.run(
+    live._handle_ingress(_FakeRequest({"action": "model", "channel": "default", "model": "claude-sonnet-4"}))
+)
+check("a setting is accepted without being said in the conversation", accepted.status == 200, str(accepted.status))
+check(
+    "and lands on the CONVERSATION's key, not on a session id",
+    store.models and store.models[-1][0] == "agent:main:familiar:dm:default",
+    str(store.models[-1] if store.models else None),
+)
+check(
+    "as the override the gateway keeps, which is what survives /new",
+    store.models[-1][1] == {"model": "claude-sonnet-4"},
+    str(store.models[-1][1] if store.models else None),
+)
+
+asyncio.run(live._handle_ingress(_FakeRequest({"action": "model", "channel": "default", "model": ""})))
+check(
+    "an empty model clears it, which is how a conversation goes back to the instance's own default",
+    store.models[-1][1] is None,
+    str(store.models[-1][1]),
+)
+
+asyncio.run(live._handle_ingress(_FakeRequest({"action": "something-not-invented-here", "channel": "default"})))
+check(
+    "an action this plugin does not know is ignored rather than guessed at",
+    store.models[-1][0] == "agent:main:familiar:dm:default",
+    str(store.models[-1]),
+)
 
 # 5. The asks: a question, a permission, and the gateway's own hold on a command it will not undo.
 print("\nasks")
