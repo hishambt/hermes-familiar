@@ -63,8 +63,8 @@ plugin is: a platform, a sender, and no way in.
 The intended path is Familiar's own Console, which runs Hermes commands on the machine its backend is on. Four
 cards, in this order:
 
-1. **Plugins → Install a plugin**: `hishambt/hermes-familiar-notify`
-2. **Plugins → Enable a plugin**: `familiar-notify-platform`
+1. **Plugins → Install a plugin**: `hishambt/hermes-familiar`
+2. **Plugins → Enable a plugin**: `familiar-platform`
 3. **Configuration → Set a setting**:
    - `FAMILIAR_TOKEN=<the token Familiar issued for this instance>` (the `_TOKEN` suffix is what routes it to
      `.env` rather than `config.yaml`)
@@ -75,13 +75,13 @@ cards, in this order:
 From a terminal it is the same four steps:
 
 ```bash
-hermes plugins install hishambt/hermes-familiar-notify
-hermes plugins enable familiar-notify-platform
+hermes plugins install hishambt/hermes-familiar
+hermes plugins enable familiar-platform
 hermes config set FAMILIAR_TOKEN <the token Familiar issued for this instance>
 hermes gateway restart
 ```
 
-Verify with `hermes plugins doctor familiar-notify-platform` and `hermes gateway status` (the platform appears
+Verify with `hermes plugins doctor familiar-platform` and `hermes gateway status` (the platform appears
 once a token is set). A job then gets `deliver: familiar` from Familiar's own job dialog.
 
 ### The self-check
@@ -93,7 +93,7 @@ then delivers to a stub receiver on loopback and reads what arrived (path, beare
 
 ```bash
 cd "$LOCALAPPDATA/hermes/hermes-agent"
-./venv/Scripts/python.exe "C:/Work/Personal/Familiar/hermes-familiar-notify/check.py"
+./venv/Scripts/python.exe "C:/Work/Personal/Familiar/hermes-familiar/check.py"
 ```
 
 ## Settings
