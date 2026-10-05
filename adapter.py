@@ -30,6 +30,7 @@ from __future__ import annotations
 import socket
 import time
 import asyncio
+import contextlib
 import json
 import logging
 import urllib.error
