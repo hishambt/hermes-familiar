@@ -51,6 +51,9 @@ NOTIFY_PATH = "/api/hermes/notifications"
 ASK_PATH = "/api/hermes/ask"
 #: Where Familiar posts what a person said, and the answers to the asks above. One route for both:
 #: the gateway routes a message that arrives while a run is parked to the clarify intercept.
+#: Where the agent's reply goes. A reply in a conversation is not a job delivery, so it must not land
+#: in the notification list a cron output is addressed to - hence a path of its own.
+MESSAGE_PATH = "/api/hermes/message"
 INGRESS_PATH = "/familiar/ingress"
 #: The port this adapter listens on inside the instance. The api_server holds 8642 and the dashboard
 #: 8080, so the channel takes the next one.
@@ -313,13 +316,17 @@ class FamiliarAdapter(BasePlatformAdapter):
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
-        """POST one delivery. ``chat_id`` is the job's target; the default is the instance's inbox."""
+        """Send a reply into a Familiar conversation. ``chat_id`` is the conversation; the default is the
+        instance's own inbox."""
         if not self._token:
             return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
 
         payload = _payload(self._instance, chat_id or self._home, content, metadata)
         try:
-            body = await asyncio.to_thread(_post, self._url, self._token, payload)
+            # MESSAGE_PATH, not the notification path: this is a reply in a conversation, and it would be wrong
+            # in the list an operator reads job output from. A cron delivery still uses the notification path,
+            # through standalone_sender_fn.
+            body = await asyncio.to_thread(_post, self._url, self._token, payload, MESSAGE_PATH)
         except _DeliveryError as error:
             logger.warning("[%s] Delivery failed: %s", self.name, error)
             return SendResult(success=False, error=str(error), retryable=error.retryable)
