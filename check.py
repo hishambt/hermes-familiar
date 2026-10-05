@@ -144,16 +144,26 @@ check("seeds extra from env", seed and seed.get("url") == URL and seed.get("toke
 check("lifts a home channel", seed.get("home_channel") == {"chat_id": "default", "name": "Familiar"}, str(seed.get("home_channel")))
 check("is_connected with a token", adapter.is_connected(config(token="tok_abc123", url=URL)))
 with without_env("FAMILIAR_TOKEN"):
-    check("not connected without one, in extra or the env", not adapter.is_connected(config(url=URL)))
-saved_token = os.environ.pop("FAMILIAR_TOKEN")
-check("no token in the environment means no seed, so the platform stays disabled", adapter._env_enablement() is None)
-os.environ["FAMILIAR_TOKEN"] = saved_token
+    # A machine pointed at a Familiar but not yet paired is CONFIGURED: it loads, asks for a code, and is paired by
+    # whoever is sitting at it. Requiring a token here would refuse to load the one machine that pairs.
+    check("connected without a token too, because a machine that can pair is configured", adapter.is_connected(config(url=URL)))
+with without_env("FAMILIAR_URL", "FAMILIAR_TOKEN"):
+    check("nowhere to talk to means no seed, so the platform stays disabled", adapter._env_enablement() is None)
+with without_env("FAMILIAR_TOKEN"):
+    unpair = adapter._env_enablement()
+check("a URL alone seeds, with no token on it", unpair is not None and "token" not in unpair, str(unpair))
 
 live = adapter.FamiliarAdapter(config(url=URL, token="tok_abc123"))
 check("connect() reports ready", asyncio.run(live.connect()) is True)
 check("home target defaults to 'default'", live._home == "default")
 with without_env("FAMILIAR_TOKEN"):
-    check("connect() refuses without a token", asyncio.run(adapter.FamiliarAdapter(config(url=URL)).connect()) is False)
+    # The channel is the direction that needs NOTHING on this machine: it dials out. So an unpaired machine still
+    # connects - that is how it pairs - and only the ingress waits for a token to authenticate with.
+    unpaired_machine = adapter.FamiliarAdapter(config(url=URL))
+    check("connect() starts without a token, because the channel dials out", asyncio.run(unpaired_machine.connect()) is True)
+    check("and leaves the ingress alone until it has one", unpaired_machine._ingress_runner is None)
+    unpaired_machine._channel_task.cancel()
+    asyncio.run(unpaired_machine.disconnect())
 
 # 3. A delivery, and what the receiver sees.
 print("\ndelivery")

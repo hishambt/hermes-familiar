@@ -27,6 +27,7 @@ blocks the gateway's event loop.
 
 from __future__ import annotations
 
+import socket
 import time
 import asyncio
 import json
@@ -51,10 +52,57 @@ NOTIFY_PATH = "/api/hermes/notifications"
 #: convention as the notification path - one base URL, one path per kind of thing being delivered.
 ASK_PATH = "/api/hermes/ask"
 
+#: The channel: the connection THIS machine opens, and the requests Familiar sends down it. Everything else here
+#: is outbound too, but this is the one that makes the machine reachable in the other direction - which is what a
+#: machine behind NAT, with no port forwarded and no key, cannot otherwise be.
+CHANNEL_STREAM_PATH = "/api/channel/stream"
+CHANNEL_REPLY_PATH = "/api/channel/reply"
+CHANNEL_PAIR_PATH = "/api/channel/pair"
+CHANNEL_PAIR_WAIT_PATH = "/api/channel/pair/wait"
+
+#: Where a paired machine keeps the token it was given. Beside the plugin, because it belongs to the INSTALL and
+#: not to a Hermes config: nothing a reader edits by hand should hold a credential that arrives by pairing.
+STATE_FILE = "state.json"
+
+#: A connection that drops is retried: the far end restarting is not a reason to give up. Backing off, because a
+#: machine that reconnects in a tight loop is a machine nobody can use.
+RECONNECT_MIN_S = 1.0
+RECONNECT_MAX_S = 30.0
+
 #: The answer to a confirmation this adapter raised: ``cf:<confirm_id>:<once|cancel>``. The gateway's own text
 #: fallback spells these as commands (``/approve``, ``/cancel``); this is the same answer without relying on a
 #: message that is not a message becoming one.
 CONFIRM_PREFIX = "cf:"
+
+#: Loopback-only: what this machine answers when somebody asks it what code it is showing.
+PAIR_PATH = "/familiar/pair"
+
+
+def _state_path() -> Path:
+	return Path(__file__).resolve().parent / STATE_FILE
+
+
+def _load_token() -> str:
+	"""The token this machine was given when it was paired, or an empty string."""
+	try:
+		return str(json.loads(_state_path().read_text(encoding="utf-8")).get("token") or "")
+	except Exception:  # noqa: BLE001 - no state, unreadable state: both mean "not paired yet"
+		return ""
+
+
+def _save_token(token: str) -> None:
+	"""Keep the token across restarts. A machine that has to pair again after every restart is not paired."""
+	try:
+		_state_path().write_text(json.dumps({"token": token}, indent="\t"), encoding="utf-8")
+	except Exception as error:  # noqa: BLE001 - a token that will not persist is worth a warning, not a crash
+		logger.warning("[familiar] could not save this machine's pairing: %s", error)
+
+
+def _clear_token() -> None:
+	try:
+		_state_path().unlink(missing_ok=True)
+	except Exception as error:  # noqa: BLE001
+		logger.warning("[familiar] could not clear this machine's pairing: %s", error)
 
 
 def _plugin_version() -> str:
@@ -263,8 +311,12 @@ def check_requirements() -> bool:
 
 
 def validate_config(config) -> bool:
-	"""True when a token is configured, in ``extra`` or the env."""
-	return bool(_setting(getattr(config, "extra", {}) or {}, "token", "FAMILIAR_TOKEN"))
+	"""True when there is a Familiar to talk to, in ``extra`` or the env.
+
+	A URL is the whole of it. The token arrives by PAIRING, so requiring one here would refuse to load the plugin on
+	a machine that has not been paired yet - which is precisely the machine that pairs.
+	"""
+	return bool(_setting(getattr(config, "extra", {}) or {}, "url", "FAMILIAR_URL"))
 
 
 def is_connected(config) -> bool:
@@ -314,6 +366,9 @@ class FamiliarAdapter(BasePlatformAdapter):
 		# chat key -> the directory this conversation works in. Kept in the process as well as applied, so every
 		# later turn of the conversation gets it even though only the ACT of choosing comes through the ingress.
 		self._directories: Dict[str, str] = {}
+		# The connection this machine holds to Familiar, and the code it is showing while it waits to be paired.
+		self._channel_task: Optional[Any] = None
+		self._pair_code: str = ""
 		# The lifted HomeChannel is the canonical store; extra and the env are the fallbacks.
 		self._home: str = (
 			str(getattr(config.home_channel, "chat_id", "") or "")
@@ -328,18 +383,32 @@ class FamiliarAdapter(BasePlatformAdapter):
 		This is the direction that makes Familiar a channel rather than a notifier. The other direction - the
 		notifications and the asks - is outbound HTTP, and needs no listener at all.
 		"""
-		if not self._token:
-			logger.warning("[%s] FAMILIAR_TOKEN is not set, so deliveries would be refused", self.name)
-			return False
+		# The CHANNEL is the direction that needs nothing on this machine: it dials out, so a machine that has never
+		# been paired still connects - and connecting is how it pairs. The INGRESS needs a token to authenticate with,
+		# so a machine without one skips it and says why rather than refusing to load at all.
+		started = False
 
-		if not self._url:
-			logger.warning("[familiar] no FAMILIAR_URL configured - outbound delivery will fail")
+		if self._url and self._channel_task is None:
+			self._channel_task = asyncio.create_task(self._channel_loop())
+			started = True
+		elif not self._url:
+			logger.warning("[familiar] no FAMILIAR_URL configured, so there is nothing to connect to")
+
+		if not self._token:
+			logger.info("[familiar] not paired yet: the channel asks for a code, and the ingress waits for one")
+
+			if started:
+				self._mark_connected()
+
+			return started
 
 		from aiohttp import web
 
 		app = web.Application()
 		app.router.add_post(INGRESS_PATH, self._handle_ingress)
 		app.router.add_get(INGRESS_PATH, self._handle_ingress_probe)
+		# What a person standing at this machine can ask it: the pairing code, or that it is already paired.
+		app.router.add_get(PAIR_PATH, self._handle_pair_probe)
 
 		runner = web.AppRunner(app, access_log=None)
 		await runner.setup()
@@ -357,7 +426,174 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 		return True
 
+	async def _machine_name(self) -> str:
+		"""What this machine calls itself when it pairs. The instance is named this until somebody renames it."""
+		try:
+			return socket.gethostname() or "Hermes"
+
+		except Exception:  # noqa: BLE001 - a machine with no name is still a machine
+			return "Hermes"
+
+	async def _channel_loop(self) -> None:
+		"""Keep a connection to Familiar open, for as long as this machine is running.
+
+		A machine behind NAT cannot be dialled; it can dial. So this holds one outbound connection and everything
+		Familiar wants travels down it - no address on this machine, no key, nothing listening.
+
+		A machine that was never paired PAIRS first: it asks for a code and shows it, and the person who can see
+		that code is the person sitting here, which is who it is for.
+		"""
+		delay = RECONNECT_MIN_S
+
+		while True:
+			try:
+				token = self._token or _load_token()
+
+				if not token:
+					await self._pair()
+					delay = RECONNECT_MIN_S
+
+					continue
+
+				self._token = token
+				await self._hold_channel(token)
+				delay = RECONNECT_MIN_S
+			except asyncio.CancelledError:
+				raise
+			except Exception as error:  # noqa: BLE001 - a connection that drops is retried, never fatal
+				logger.warning("[%s] channel dropped: %s", self.name, error)
+
+			await asyncio.sleep(delay)
+			delay = min(delay * 2, RECONNECT_MAX_S)
+
+	async def _hold_channel(self, token: str) -> None:
+		"""Hold the connection open, and answer what comes down it."""
+		import aiohttp
+
+		# No total timeout: this connection is meant to stay open for days, and a deadline on it would be a
+		# reconnect every time the deadline passed.
+		timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
+
+		async with aiohttp.ClientSession(timeout=timeout) as session:
+			async with session.get(
+				f"{self._url}{CHANNEL_STREAM_PATH}",
+				headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"},
+			) as response:
+				if response.status == 401:
+					# Not a token this Familiar knows: revoked, or this machine was unpaired elsewhere. Pairing again
+					# is the answer - but only for a token WE stored, because one from the environment is somebody's
+					# deliberate configuration and clearing it would fight them.
+					if _load_token():
+						logger.warning("[familiar] this Familiar no longer accepts this machine's token; pairing again")
+						_clear_token()
+
+					raise RuntimeError(f"the channel refused this machine's token (HTTP {response.status})")
+
+				if response.status != 200:
+					raise RuntimeError(f"the channel answered HTTP {response.status}")
+
+				logger.info("[familiar] channel open to %s", self._url)
+
+				event = ""
+
+				async for raw in response.content:
+					line = raw.decode("utf-8", "replace").rstrip("\r\n")
+
+					if line.startswith("event: "):
+						event = line[7:].strip()
+					elif line.startswith("data: ") and event == "request":
+						try:
+							frame = json.loads(line[6:])
+						except json.JSONDecodeError:
+							logger.warning("[familiar] a request arrived that could not be read")
+							continue
+
+						asyncio.create_task(self._answer_request(frame, token))
+					elif not line:
+						event = ""
+
+	async def _answer_request(self, frame: Dict[str, Any], token: str) -> None:
+		"""Do what Familiar asked down the channel, and answer with the id it came with.
+
+		What arrives this way is the same thing the ingress carries - a setting changed in the app - so it goes
+		through the same handler: one implementation, two doors, and no second idea of what setting a model means.
+		An answer is owed either way, because the app is waiting on this id and nothing else will settle it.
+		"""
+		request_id = str(frame.get("id") or "")
+		channel = str(frame.get("channel") or self._home)
+
+		try:
+			known = await self._apply_action(frame, channel)
+			result: Dict[str, Any] = {"ok": True} if known else {"error": f"unknown action: {frame.get('action')}"}
+		except Exception as error:  # noqa: BLE001 - an answer is owed either way
+			logger.warning("[%s] a channel request failed: %s", self.name, error)
+			result = {"error": str(error)}
+
+		try:
+			await asyncio.to_thread(
+				_post, self._url, token, {"id": request_id, "result": result}, CHANNEL_REPLY_PATH)
+		except _DeliveryError as error:
+			logger.warning("[%s] could not answer a channel request: %s", self.name, error)
+
+	async def _pair(self) -> None:
+		"""Ask Familiar for a code, show it, and wait for it to be claimed.
+
+		The code is logged, and served on this machine's own loopback, because whoever can see either is whoever is
+		sitting at the machine - which is exactly who the code is for. Nothing is created on the other end until
+		they type it, so asking costs nothing and leaves nothing behind.
+		"""
+		import aiohttp
+
+		timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
+
+		async with aiohttp.ClientSession(timeout=timeout) as session:
+			started = await session.post(
+				f"{self._url}{CHANNEL_PAIR_PATH}",
+				json={"name": await self._machine_name(), "version": PLUGIN_VERSION},
+			)
+			body = await started.json() if started.status == 200 else {}
+			code = str(body.get("code") or "")
+			secret = str(body.get("secret") or "")
+
+			if not code or not secret:
+				raise RuntimeError(f"pairing was refused (HTTP {started.status})")
+
+			self._pair_code = code
+			logger.warning("[familiar] PAIR: enter the code %s in Familiar, and this machine connects", code)
+
+			async with session.get(f"{self._url}{CHANNEL_PAIR_WAIT_PATH}?secret={secret}") as response:
+				event = ""
+
+				async for raw in response.content:
+					line = raw.decode("utf-8", "replace").rstrip("\r\n")
+
+					if line.startswith("event: "):
+						event = line[7:].strip()
+					elif line.startswith("data: ") and event == "paired":
+						try:
+							paired = json.loads(line[6:])
+						except json.JSONDecodeError:
+							continue
+
+						token = str(paired.get("token") or "")
+
+						if token:
+							_save_token(token)
+							self._token = token
+							self._pair_code = ""
+							logger.info("[familiar] paired: this machine is reachable through the channel now")
+
+						return
+
 	async def disconnect(self) -> None:
+		if self._channel_task is not None:
+			self._channel_task.cancel()
+
+			with contextlib.suppress(asyncio.CancelledError, Exception):
+				await self._channel_task
+
+			self._channel_task = None
+
 		if self._ingress_runner is not None:
 			await self._ingress_runner.cleanup()
 			self._ingress_runner = None
@@ -394,6 +630,20 @@ class FamiliarAdapter(BasePlatformAdapter):
 		from aiohttp import web
 
 		return web.json_response({"ok": True, "platform": "familiar"})
+
+	async def _handle_pair_probe(self, request: Any) -> Any:
+		"""The code this machine is showing, or that it is already paired.
+
+		On loopback only, like the rest of the ingress: whoever can reach this is whoever is sitting at the machine,
+		which is exactly who the code is for.
+		"""
+		from aiohttp import web
+
+		return web.json_response({
+			"paired": bool(self._token),
+			"code": self._pair_code or None,
+			"version": PLUGIN_VERSION,
+		})
 
 	async def _handle_ingress(self, request: Any) -> Any:
 		"""A message from Familiar, turned into the event the gateway runs.
@@ -615,7 +865,7 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 		return SendResult(success=True, message_id=str(confirm_id) or None)
 
-	async def _apply_action(self, payload: Dict[str, Any], chat_id: str) -> None:
+	async def _apply_action(self, payload: Dict[str, Any], chat_id: str) -> bool:
 		"""Apply a setting Familiar changed, without it becoming something said in the conversation.
 
 		Two so far: which model a conversation runs on, and where it works. Both are kept under the CHAT key rather
@@ -629,12 +879,16 @@ class FamiliarAdapter(BasePlatformAdapter):
 		if handler is None:
 			logger.warning("[%s] ignoring an action it does not know: %s", self.name, action)
 
-			return
+			return False
 
 		key = self._chat_key(str(chat_id))
 
-		if key:
-			handler(key, payload)
+		if not key:
+			return False
+
+		handler(key, payload)
+
+		return True
 
 	def _chat_key(self, chat_id: str) -> str:
 		"""The routing key for a conversation: what a setting is kept under, and what outlives a session."""
@@ -792,17 +1046,23 @@ class FamiliarAdapter(BasePlatformAdapter):
 def _env_enablement() -> Optional[dict]:
 	"""Seed ``PlatformConfig.extra`` from env vars during gateway config load.
 
-	``None`` when no token is set: a platform nobody configured must not be enabled, or the gateway
+	``None`` when there is nowhere to talk to: a platform nobody configured must not be enabled, or the gateway
 	delivers into it and reports failures for a channel the user never asked for. The ``home_channel`` key
 	is lifted into a ``HomeChannel`` on the ``PlatformConfig`` instead of being merged into ``extra``.
+
+	A URL is the whole of "configured" now. The token arrives by PAIRING, so a machine that has only been pointed
+	at a Familiar still loads - it shows a code, and whoever is sitting at it types that into the app.
 	"""
+	url = (_get_scoped_secret("FAMILIAR_URL", "") or "").strip().rstrip("/")
 	token = (_get_scoped_secret("FAMILIAR_TOKEN", "") or "").strip()
-	if not token:
+
+	if not url and not token:
 		return None
-	seed: Dict[str, Any] = {
-		"url": (_get_scoped_secret("FAMILIAR_URL", "") or DEFAULT_URL).strip().rstrip("/"),
-		"token": token,
-	}
+
+	seed: Dict[str, Any] = {"url": url or DEFAULT_URL}
+
+	if token:
+		seed["token"] = token
 	instance = (_get_scoped_secret("FAMILIAR_INSTANCE", "") or "").strip()
 	if instance:
 		seed["instance"] = instance
