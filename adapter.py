@@ -268,6 +268,10 @@ class FamiliarAdapter(BasePlatformAdapter):
 		self._ingress_port: int = int(
 			_setting(extra, "ingress_port", "FAMILIAR_INGRESS_PORT", str(DEFAULT_INGRESS_PORT)) or DEFAULT_INGRESS_PORT)
 		self._ingress_runner: Optional[Any] = None
+		# chat id -> the session key that conversation is routed by. The routing entry is the only thing that
+		# knows which SESSION an address is on, and it is the gateway's, so it has to be asked per reply rather
+		# than remembered: /new, /reset and a compression rotation all move the key to another session.
+		self._session_keys: Dict[str, str] = {}
 		# The lifted HomeChannel is the canonical store; extra and the env are the fallbacks.
 		self._home: str = (
 			str(getattr(config.home_channel, "chat_id", "") or "")
@@ -333,6 +337,7 @@ class FamiliarAdapter(BasePlatformAdapter):
 			return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
 
 		payload = _payload(self._instance, chat_id or self._home, content, metadata)
+		payload["sessionId"] = self._current_session_id(chat_id)
 		try:
 			# MESSAGE_PATH, not the notification path: this is a reply in a conversation, and it would be wrong
 			# in the list an operator reads job output from. A cron delivery still uses the notification path,
@@ -397,6 +402,11 @@ class FamiliarAdapter(BasePlatformAdapter):
 			             "this adapter, so no turn can start")
 			return web.json_response({"accepted": False, "reason": "no message handler"}, status=503)
 
+		# Which session this conversation is on, resolved here rather than left to the client: Familiar minted
+		# the ADDRESS and the gateway mints the session id, and nothing outside this process can map one to the
+		# other. It rides this response, so a client knows its conversation's session from the first message.
+		session_id = await self._resolve_session(source, declared=str(payload.get("sessionId") or ""))
+
 		# Dispatched as a task, as every adapter does it: the turn can take minutes, and the caller - Familiar -
 		# is waiting on a prompt HTTP response, not on the agent.
 		task = asyncio.create_task(self.handle_message(event))
@@ -409,7 +419,53 @@ class FamiliarAdapter(BasePlatformAdapter):
 		self._background_tasks.add(task)
 		task.add_done_callback(_report)
 
-		return web.json_response({"accepted": True, "messageId": event.message_id})
+		return web.json_response({"accepted": True, "messageId": event.message_id, "sessionId": session_id})
+
+	async def _resolve_session(self, source: Any, declared: str = "") -> str:
+		"""The session this conversation is on, creating it when the conversation has not started yet.
+
+		An address is not a session: Familiar mints the chat id, the gateway mints the session id the first time a
+		key is used, and the two are never equal. This is the only place that can say which session an address is
+		on, so it says it back to whoever asked.
+
+		``declared`` is a session the client already holds and means this conversation to continue - a session it
+		forked, most of all. It is ADOPTED rather than replaced: the key is pointed at it, which is the same move
+		``/resume`` makes, and the reason a fork needs the channel to adopt it before its first message can carry
+		its context.
+		"""
+		store = getattr(self, "_session_store", None)
+		if store is None:
+			return ""
+
+		try:
+			entry = await asyncio.to_thread(store.get_or_create_session, source)
+			if declared and entry.session_id != declared:
+				# Order matters: switch_session only re-points a key that already exists, so the entry is made
+				# first and the switch ends it rather than leaving two live sessions for one conversation.
+				switched = await asyncio.to_thread(store.switch_session, entry.session_key, declared)
+				if switched is not None:
+					entry = switched
+			self._session_keys[str(source.chat_id)] = entry.session_key
+			return entry.session_id
+		except Exception as error:  # noqa: BLE001 - a session nobody can name must not cost the turn
+			logger.warning("[familiar] could not resolve the session for %s: %s", source.chat_id, error)
+			return ""
+
+	def _current_session_id(self, chat_id: str) -> str:
+		"""The session a conversation is on NOW, or "" when nothing here has routed it.
+
+		Read per reply rather than remembered from the ingress, so a rotation that happened DURING the turn -
+		``/new``, ``/reset``, a compression that moved the conversation - is already reflected in what the client
+		is told. That is what lets a topic follow its conversation instead of being pinned to a dead session id.
+		"""
+		key = self._session_keys.get(str(chat_id or self._home))
+		store = getattr(self, "_session_store", None)
+		if not key or store is None:
+			return ""
+		try:
+			return store.peek_session_id(key) or ""
+		except Exception:  # noqa: BLE001 - a reply without a session id is still a reply
+			return ""
 
 	async def send_clarify(
 		self,
