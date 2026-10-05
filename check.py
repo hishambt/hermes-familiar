@@ -245,6 +245,81 @@ check("by pointing the key at it, the move /resume makes", store.switched_to == 
 asyncio.run(live._resolve_session(source, declared="20261005_090000_forked01"))
 check("and one already on the key is left alone", store.switched_to == ["20261005_090000_forked01"])
 
+# 5. The asks: a question, a permission, and the gateway's own hold on a command it will not undo.
+print("\nasks")
+
+SESSION_KEY = "agent:main:familiar:dm:default"
+
+asyncio.run(
+    live.send_clarify("default", "Which store?", ["postgres", "sqlite"], "cl_1", SESSION_KEY)
+)
+clarify = RECEIVED[-1]
+check("a clarify goes to the ask path", clarify["path"] == "/api/hermes/ask", clarify["path"])
+check("as a clarify", clarify["json"]["kind"] == "clarify", str(clarify["json"].get("kind")))
+check("carrying the id its answer comes back with", clarify["json"]["requestId"] == "cl_1", str(clarify["json"].get("requestId")))
+check("and the choices the reader picks from", clarify["json"]["choices"] == ["postgres", "sqlite"], str(clarify["json"].get("choices")))
+check("under the prefix every adapter shares", clarify["json"]["callbackPrefix"] == "cl", str(clarify["json"].get("callbackPrefix")))
+
+asyncio.run(
+    live.send_exec_approval(
+        "default", "rm -rf /tmp/probe", session_key=SESSION_KEY, description="Deletes a directory", request_id="appr_1"
+    )
+)
+approval = RECEIVED[-1]
+check("an approval is its own kind", approval["json"]["kind"] == "approval", str(approval["json"].get("kind")))
+check(
+    "what would run and why it is asked are not the same thing",
+    approval["json"]["command"] == "rm -rf /tmp/probe" and approval["json"]["description"] == "Deletes a directory",
+    str(approval["json"]),
+)
+
+# The gateway's own hold, registered where it actually lives: the remaining time is read from that entry, not
+# assumed, so the countdown a reader sees is the one that is running.
+from tools import slash_confirm as slash_confirm_mod  # noqa: E402
+
+
+async def _hold(choice: str):
+    return f"the hold ran with {choice}"
+
+
+slash_confirm_mod.register(SESSION_KEY, "cf_1", "/new", _hold)
+asyncio.run(
+    live.send_slash_confirm(
+        "default", "Confirm /new", "This starts a fresh session.", SESSION_KEY, "cf_1"
+    )
+)
+confirm = RECEIVED[-1]
+check("a confirmation is its own kind, not a message", confirm["json"]["kind"] == "confirm", str(confirm["json"].get("kind")))
+check("under its own prefix, so the answer is not read as something said", confirm["json"]["callbackPrefix"] == "cf", str(confirm["json"].get("callbackPrefix")))
+check("with the two answers this app offers", confirm["json"]["choices"] == ["once", "cancel"], str(confirm["json"].get("choices")))
+check("and no 'always': that is a persisted setting, not a choice in a chat", "always" not in confirm["json"]["choices"])
+check(
+    "carrying the time left on the hold, read from the hold itself",
+    isinstance(confirm["json"]["expiresIn"], int)
+    and 0 < confirm["json"]["expiresIn"] <= slash_confirm_mod.DEFAULT_TIMEOUT_SECONDS,
+    str(confirm["json"].get("expiresIn")),
+)
+
+before_answer = len(RECEIVED)
+asyncio.run(live._resolve_confirm("cf:cf_1:once", "default"))
+check("answering it resolves the hold rather than becoming a turn", slash_confirm_mod.get_pending(SESSION_KEY) is None)
+check("and says what the gateway did", RECEIVED[-1]["json"]["content"] == "the hold ran with once", str(RECEIVED[-1]["json"].get("content")))
+check("as a reply, on the message path", RECEIVED[-1]["path"] == "/api/hermes/message" and len(RECEIVED) == before_answer + 1)
+
+asyncio.run(live._resolve_confirm("cf:nobody-knows-this:once", "default"))
+check(
+    "an answer to a hold that is gone says nothing was done, instead of a spinner",
+    "nothing was done" in RECEIVED[-1]["json"]["content"],
+    str(RECEIVED[-1]["json"].get("content")),
+)
+
+asyncio.run(live.send_slash_confirm("default", "Confirm /clear", "Clears the transcript.", SESSION_KEY, "cf_unknown"))
+check(
+    "a hold this process cannot see still goes out, and says it has no clock rather than inventing one",
+    RECEIVED[-1]["json"]["kind"] == "confirm" and RECEIVED[-1]["json"]["expiresIn"] is None,
+    str(RECEIVED[-1]["json"].get("expiresIn")),
+)
+
 # 5. Failures.
 print("\nfailures")
 REPLY.update({"code": 401, "body": json.dumps({"message": "invalid token"})})
