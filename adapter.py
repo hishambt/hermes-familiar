@@ -45,6 +45,9 @@ logger = logging.getLogger(__name__)
 DEFAULT_URL = "http://127.0.0.1:3100"
 DEFAULT_TARGET = "default"
 NOTIFY_PATH = "/api/hermes/notifications"
+#: Where the agent's asks go: a clarify question, and a command approval. Same convention as the
+#: notification path - one base URL, one path per kind of thing being delivered.
+ASK_PATH = "/api/hermes/ask"
 
 """
 What one delivery carries before it is cut.
@@ -136,14 +139,14 @@ def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[s
     }
 
 
-def _post(url: str, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _post(url: str, token: str, payload: Dict[str, Any], path: str = NOTIFY_PATH) -> Dict[str, Any]:
     """One POST to Familiar, run in a worker thread. Returns its parsed response body.
 
     ``urllib`` rather than a client library: a delivery channel that stops working because an optional
     import moved is worse than a few more lines here.
     """
     request = urllib.request.Request(
-        f"{url}{NOTIFY_PATH}",
+        f"{url}{path}",
         data=json.dumps(payload).encode("utf-8"),
         method="POST",
         headers={
@@ -172,6 +175,35 @@ def _post(url: str, token: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     except json.JSONDecodeError:
         return {}
     return body if isinstance(body, dict) else {}
+
+
+def _ask_payload(
+    instance: str,
+    target: str,
+    kind: str,
+    body: str,
+    choices: Optional[List[str]],
+    request_id: str,
+    session_key: str,
+    callback_prefix: str,
+) -> Dict[str, Any]:
+    """What Familiar receives when the agent needs an answer.
+
+    ``requestId`` is the thing that makes the answer land: the gateway resolves the reply through
+    ``tools.clarify_gateway.resolve_gateway_clarify`` (or ``tools.approval.resolve_gateway_approval``), and
+    neither can when the id is lost. ``callbackPrefix`` is the shared convention - ``cl`` for clarify,
+    ``appr`` for an approval - so the client builds the same callback ids every adapter uses.
+    """
+    return {
+        "instance": instance,
+        "target": target,
+        "kind": kind,
+        "body": body,
+        "choices": choices or [],
+        "requestId": request_id,
+        "sessionKey": session_key,
+        "callbackPrefix": callback_prefix,
+    }
 
 
 def check_requirements() -> bool:
@@ -314,6 +346,65 @@ async def _standalone_send(
         "chat_id": payload["target"],
         "message_id": str(body["id"]) if body.get("id") else None,
     }
+
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: Optional[List[str]] = None,
+        clarify_id: str = "",
+        session_key: str = "",
+        **kwargs: Any,
+    ) -> SendResult:
+        """Carry a clarify question to Familiar with the id its answer must come back with.
+
+        The gateway is blocked on this: the next inbound message from Familiar is routed to the clarify text
+        intercept, and a tap on one of the choices resolves it through ``resolve_gateway_clarify``. Nothing is
+        resolved here - this only gets the question out, and the id with it.
+        """
+        if not self._token:
+            return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
+
+        payload = _ask_payload(
+            self._instance, chat_id or self._home, "clarify", question, choices, clarify_id, session_key, "cl")
+        try:
+            await asyncio.to_thread(_post, self._url, self._token, payload, ASK_PATH)
+        except _DeliveryError as error:
+            logger.warning("[%s] Clarify failed: %s", self.name, error)
+            return SendResult(success=False, error=str(error), retryable=error.retryable)
+
+        return SendResult(success=True, message_id=clarify_id or None)
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str = "",
+        description: str = "",
+        **kwargs: Any,
+    ) -> SendResult:
+        """Carry a command approval to Familiar. Its answer goes to ``resolve_gateway_approval``."""
+        if not self._token:
+            return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
+
+        payload = _ask_payload(
+            self._instance,
+            chat_id or self._home,
+            "approval",
+            description or command,
+            kwargs.get("choices") or ["once", "deny"],
+            str(kwargs.get("request_id") or ""),
+            session_key,
+            "appr",
+        )
+        try:
+            await asyncio.to_thread(_post, self._url, self._token, payload, ASK_PATH)
+        except _DeliveryError as error:
+            logger.warning("[%s] Approval failed: %s", self.name, error)
+            return SendResult(success=False, error=str(error), retryable=error.retryable)
+
+        return SendResult(success=True, message_id=str(kwargs.get("request_id") or "") or None)
 
 
 def register(ctx) -> None:

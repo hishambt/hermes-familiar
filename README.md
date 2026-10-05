@@ -1,4 +1,4 @@
-# hermes-familiar-notify
+# hermes-familiar
 
 A Hermes plugin that delivers output to a [Familiar](https://github.com/hishambt/familiar-frontend) client's
 notifications. Runs on the machine Hermes runs on. Standard library only.
