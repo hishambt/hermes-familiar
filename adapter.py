@@ -196,6 +196,8 @@ def _ask_payload(
     request_id: str,
     session_key: str,
     callback_prefix: str,
+    command: Optional[str] = None,
+    description: Optional[str] = None,
 ) -> Dict[str, Any]:
     """What Familiar receives when the agent needs an answer.
 
@@ -210,6 +212,10 @@ def _ask_payload(
         "kind": kind,
         "body": body,
         "choices": choices or [],
+        # An approval has two halves and they are not the same thing: `command` is what would run, `description`
+        # is why. A client renders them differently, so they travel separately.
+        "command": command,
+        "description": description,
         "requestId": request_id,
         "sessionKey": session_key,
         "callbackPrefix": callback_prefix,
@@ -502,6 +508,8 @@ async def _standalone_send(
             str(kwargs.get("request_id") or ""),
             session_key,
             "appr",
+            command=command,
+            description=description,
         )
         try:
             await asyncio.to_thread(_post, self._url, self._token, payload, ASK_PATH)
