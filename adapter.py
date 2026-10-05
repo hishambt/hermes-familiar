@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from gateway.config import Platform, PlatformConfig
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms._shared import get_scoped_secret as _get_scoped_secret
 
@@ -48,6 +49,12 @@ NOTIFY_PATH = "/api/hermes/notifications"
 #: Where the agent's asks go: a clarify question, and a command approval. Same convention as the
 #: notification path - one base URL, one path per kind of thing being delivered.
 ASK_PATH = "/api/hermes/ask"
+#: Where Familiar posts what a person said, and the answers to the asks above. One route for both:
+#: the gateway routes a message that arrives while a run is parked to the clarify intercept.
+INGRESS_PATH = "/familiar/ingress"
+#: The port this adapter listens on inside the instance. The api_server holds 8642 and the dashboard
+#: 8080, so the channel takes the next one.
+DEFAULT_INGRESS_PORT = 8644
 
 """
 What one delivery carries before it is cut.
@@ -227,13 +234,13 @@ def is_connected(config) -> bool:
 
 
 class FamiliarAdapter(BasePlatformAdapter):
-    """Delivers to Familiar's notifications. Nothing comes back the other way."""
+    """Familiar as a channel: what a person says here reaches the agent, and its asks reach them."""
 
     MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
-    # Nobody can answer here: Familiar has no inbound path, so a resume prompt would be asked of nobody, and
-    # there is no turn to wake. Both flags are read generically by the gateway.
-    interactive_resume = False
+    # A person IS there: Familiar has an ingress now, so a prompt asking whether to resume an interrupted turn
+    # lands in front of someone who can answer it. Both flags are read generically by the gateway.
+    interactive_resume = True
     supports_async_delivery = False
 
     def __init__(self, config: PlatformConfig) -> None:
@@ -242,6 +249,11 @@ class FamiliarAdapter(BasePlatformAdapter):
         self._url: str = _setting(extra, "url", "FAMILIAR_URL", DEFAULT_URL).rstrip("/")
         self._token: str = _setting(extra, "token", "FAMILIAR_TOKEN")
         self._instance: str = _instance_name(extra)
+        self._ingress_token: str = _setting(extra, "ingress_token", "FAMILIAR_INGRESS_TOKEN", self._token)
+        self._ingress_host: str = _setting(extra, "ingress_host", "FAMILIAR_INGRESS_HOST", "127.0.0.1")
+        self._ingress_port: int = int(
+            _setting(extra, "ingress_port", "FAMILIAR_INGRESS_PORT", str(DEFAULT_INGRESS_PORT)) or DEFAULT_INGRESS_PORT)
+        self._ingress_runner: Optional[Any] = None
         # The lifted HomeChannel is the canonical store; extra and the env are the fallbacks.
         self._home: str = (
             str(getattr(config.home_channel, "chat_id", "") or "")
@@ -251,15 +263,45 @@ class FamiliarAdapter(BasePlatformAdapter):
     # -- Connection lifecycle -----------------------------------------------
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
-        """Nothing to connect TO: this platform only ever sends, so being configured is being connected."""
+        """Open the ingress: the one route Familiar posts a person's message to.
+
+        This is the direction that makes Familiar a channel rather than a notifier. The other direction - the
+        notifications and the asks - is outbound HTTP, and needs no listener at all.
+        """
         if not self._token:
             logger.warning("[%s] FAMILIAR_TOKEN is not set, so deliveries would be refused", self.name)
             return False
+
+        if not self._url:
+            logger.warning("[familiar] no FAMILIAR_URL configured - outbound delivery will fail")
+
+        from aiohttp import web
+
+        app = web.Application()
+        app.router.add_post(INGRESS_PATH, self._handle_ingress)
+        app.router.add_get(INGRESS_PATH, self._handle_ingress_probe)
+
+        runner = web.AppRunner(app, access_log=None)
+        await runner.setup()
+        site = web.TCPSite(runner, self._ingress_host, self._ingress_port)
+        try:
+            await site.start()
+        except OSError as error:
+            logger.error("[familiar] ingress could not bind %s:%s - %s", self._ingress_host, self._ingress_port, error)
+            return False
+
+        self._ingress_runner = runner
+        logger.info("[familiar] ingress listening on http://%s:%s%s", self._ingress_host, self._ingress_port, INGRESS_PATH)
+
         self._mark_connected()
-        logger.info("[%s] Delivering to %s as instance %r", self.name, self._url, self._instance)
+
         return True
 
     async def disconnect(self) -> None:
+        if self._ingress_runner is not None:
+            await self._ingress_runner.cleanup()
+            self._ingress_runner = None
+
         self._mark_disconnected()
 
     # -- Outbound ------------------------------------------------------------
@@ -347,6 +389,62 @@ async def _standalone_send(
         "message_id": str(body["id"]) if body.get("id") else None,
     }
 
+
+    async def _handle_ingress_probe(self, request: Any) -> Any:
+        """A health probe: whether this instance can be reached at all."""
+        from aiohttp import web
+
+        return web.json_response({"ok": True, "platform": "familiar"})
+
+    async def _handle_ingress(self, request: Any) -> Any:
+        """A message from Familiar, turned into the event the gateway runs.
+
+        One route carries everything a person does: what they typed, a tapped choice on a clarify question, and
+        an approval decision. The gateway decides which - a message that arrives while a run is parked goes to
+        the clarify intercept, and a callback id is resolved by it - so this only has to hand the text over.
+        """
+        from aiohttp import web
+
+        # The same token Familiar issues for deliveries, presented the other way round. Neither direction
+        # authenticates the other: the instance is the one proving who it is here.
+        presented = request.headers.get("Authorization", "")
+        if not self._ingress_token or presented != f"Bearer {self._ingress_token}":
+            logger.warning("[familiar] refused an ingress call: bad or missing token")
+            return web.json_response({"error": "unauthorized"}, status=401)
+
+        try:
+            payload = await request.json()
+        except Exception as error:  # noqa: BLE001 - a malformed body is the caller's problem, not the gateway's
+            logger.warning("[familiar] ingress parse error: %s", error)
+            return web.json_response({"error": "invalid payload"}, status=400)
+
+        text = str(payload.get("text") or "").strip()
+        chat_id = str(payload.get("channel") or payload.get("chatId") or self._home or DEFAULT_TARGET)
+        if not text:
+            return web.json_response({"error": "missing text"}, status=400)
+
+        source = self.build_source(
+            chat_id=chat_id,
+            chat_name=str(payload.get("channelName") or chat_id),
+            chat_type="dm",
+            user_id=str(payload.get("userId") or "familiar"),
+            user_name=str(payload.get("userName") or "Familiar"),
+        )
+        event = MessageEvent(
+            text=text,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=payload,
+            message_id=str(payload.get("messageId") or "") or None,
+        )
+
+        # Dispatched as a task, as every adapter does it: the turn can take minutes, and the caller - Familiar -
+        # is waiting on a prompt HTTP response, not on the agent.
+        task = asyncio.create_task(self.handle_message(event))
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+
+        return web.json_response({"accepted": True, "messageId": event.message_id})
 
     async def send_clarify(
         self,
