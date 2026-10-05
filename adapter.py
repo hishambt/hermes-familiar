@@ -286,6 +286,9 @@ class FamiliarAdapter(BasePlatformAdapter):
 		# where to say so. The pending hold itself lives in the gateway (``tools.slash_confirm``), so this is
 		# only the address of the answer.
 		self._confirms: Dict[str, Any] = {}
+		# chat key -> the directory this conversation works in. Kept in the process as well as applied, so every
+		# later turn of the conversation gets it even though only the ACT of choosing comes through the ingress.
+		self._directories: Dict[str, str] = {}
 		# The lifted HomeChannel is the canonical store; extra and the env are the fallbacks.
 		self._home: str = (
 			str(getattr(config.home_channel, "chat_id", "") or "")
@@ -438,6 +441,13 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 		# Dispatched as a task, as every adapter does it: the turn can take minutes, and the caller - Familiar -
 		# is waiting on a prompt HTTP response, not on the agent.
+		# The directory this conversation was given, applied again now that its session is resolved: a
+		# gateway that restarted would otherwise run this turn wherever IT was launched from. Applied before
+		# the turn is scheduled, because the turn is what reads it.
+		key = self._session_keys.get(str(chat_id))
+		if key:
+			self._apply_directory_now(key)
+
 		task = asyncio.create_task(self.handle_message(event))
 
 		def _report(task: "asyncio.Task") -> None:
@@ -583,44 +593,111 @@ class FamiliarAdapter(BasePlatformAdapter):
 	async def _apply_action(self, payload: Dict[str, Any], chat_id: str) -> None:
 		"""Apply a setting Familiar changed, without it becoming something said in the conversation.
 
-		Only one action so far: which model a conversation runs on. It is set as the CHAT key's override rather than
-		against the session id, and that is the whole point - the override is keyed by the conversation, so it
-		survives ``/new``, ``/reset`` and a compression rotation, and a model chosen for a topic is still the model
-		when that topic starts a fresh session.
+		Two so far: which model a conversation runs on, and where it works. Both are kept under the CHAT key rather
+		than a session id, and that is the whole point - the key is what survives ``/new``, ``/reset`` and a
+		compression, so a setting chosen for a topic is still the setting when that topic starts a fresh session.
 		"""
 		action = str(payload.get("action") or "").strip()
+		# A table rather than a chain of comparisons: a new setting is a line here and a method beside the others.
+		handler = {"model": self._apply_model, "directory": self._apply_directory}.get(action)
 
-		if action != "model":
+		if handler is None:
 			logger.warning("[%s] ignoring an action it does not know: %s", self.name, action)
 
 			return
 
+		key = self._chat_key(str(chat_id))
+
+		if key:
+			handler(key, payload)
+
+	def _chat_key(self, chat_id: str) -> str:
+		"""The routing key for a conversation: what a setting is kept under, and what outlives a session."""
+		key = self._session_keys.get(chat_id)
 		store = getattr(self, "_session_store", None)
 
+		if key:
+			return key
+
 		if store is None:
-			logger.warning("[%s] no session store, so a model cannot be set here", self.name)
+			logger.warning("[%s] no session store, so nothing can be set on a conversation here", self.name)
+
+			return ""
+
+		# Nothing has been said here yet, so the key is minted the way the first message would have minted it.
+		try:
+			source = self.build_source(
+				chat_id=chat_id, chat_name=chat_id, chat_type="dm", user_id="familiar", user_name="Familiar")
+			key = store.get_or_create_session(source).session_key
+			self._session_keys[chat_id] = key
+
+			return key
+		except Exception as error:  # noqa: BLE001 - a setting that cannot land is worth a warning, not a crash
+			logger.warning("[%s] could not resolve the conversation: %s", self.name, error)
+
+			return ""
+
+	def _apply_model(self, key: str, payload: Dict[str, Any]) -> None:
+		"""Point the conversation at a model. Empty clears it, which is the instance's own default."""
+		store = getattr(self, "_session_store", None)
+		model = str(payload.get("model") or "").strip()
+
+		if store is None:
+			return
+
+		# None clears it, which is how a conversation goes back to the instance's own default.
+		store.set_model_override(key, {"model": model} if model else None)
+		logger.info("[%s] model for %s is now %s", self.name, key, model or "(the instance's default)")
+
+	def _apply_directory(self, key: str, payload: Dict[str, Any]) -> None:
+		"""Where the conversation works: applied to this key's turns, and written on the session row.
+
+		Both halves are needed, and Hermes itself keeps it this way. The task override is what a running turn's
+		terminal actually reads, and it is keyed by the CHAT key - so the directory is still the directory after a
+		new session. The session row is the durable record: it survives a restart, and a fork or a compression
+		inherits it.
+		"""
+		directory = str(payload.get("directory") or "").strip()
+
+		if not directory:
+			self._directories.pop(key, None)
 
 			return
 
-		key = self._session_keys.get(str(chat_id))
+		self._directories[key] = directory
+		self._apply_directory_now(key)
 
-		if not key:
-			# Nothing has been said here yet, so the key is minted the way the first message would have minted it.
+	def _apply_directory_now(self, key: str) -> None:
+		"""Apply the directory this conversation was given. Safe to call on every turn: it is idempotent, and the
+		one it is called for is the one a new session would otherwise forget."""
+		directory = self._directories.get(key)
+
+		if not directory:
+			return
+
+		try:
+			from tools.terminal_tool import register_task_env_overrides
+
+			# "session", not "process": this is a workspace the reader picked, and the process's own cwd is where
+			# the gateway happened to be launched - the value terminal_tool refuses for exactly that reason.
+			register_task_env_overrides(key, {"cwd": directory, "cwd_source": "session"})
+		except Exception as error:  # noqa: BLE001 - a directory that cannot be applied still belongs to the topic
+			logger.warning("[%s] could not apply the working directory: %s", self.name, error)
+
+		try:
+			from pathlib import Path
+
+			from hermes_constants import get_hermes_home
+			from hermes_state_registry import acquire, release_or_close
+
+			db = acquire(Path(get_hermes_home()) / "state.db")
 			try:
-				source = self.build_source(
-					chat_id=str(chat_id), chat_name=str(chat_id), chat_type="dm",
-					user_id="familiar", user_name="Familiar")
-				key = store.get_or_create_session(source).session_key
-				self._session_keys[str(chat_id)] = key
-			except Exception as error:  # noqa: BLE001 - a setting that cannot land is worth a warning, not a crash
-				logger.warning("[%s] could not resolve the conversation for a model: %s", self.name, error)
-
-				return
-
-		model = str(payload.get("model") or "").strip()
-		# None clears it, which is how a conversation goes back to the instance's own default.
-		store.set_model_override(key, {"model": model} if model else None)
-		logger.info("[%s] model for %s is now %s", self.name, chat_id, model or "(the instance's default)")
+				if db is not None:
+					db.update_session_cwd(key, directory)
+			finally:
+				release_or_close(db)
+		except Exception as error:  # noqa: BLE001 - the live half already landed, so this is the durable one
+			logger.warning("[%s] could not persist the working directory: %s", self.name, error)
 
 	async def _resolve_confirm(self, text: str, chat_id: str) -> None:
 		"""Resolve the confirmation the reader answered, and say what happened either way.
@@ -770,3 +847,4 @@ def register(ctx) -> None:
 		max_message_length=0,
 		emoji="🛰️",
 	)
+

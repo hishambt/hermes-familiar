@@ -292,6 +292,22 @@ check(
     str(store.models[-1][1]),
 )
 
+asyncio.run(
+    live._handle_ingress(_FakeRequest({"action": "directory", "channel": "default", "directory": "/srv/work"}))
+)
+from tools.terminal_tool import _task_env_overrides  # noqa: E402
+
+check(
+    "a working directory is applied to the CONVERSATION, which is what survives a new session",
+    _task_env_overrides.get("agent:main:familiar:dm:default", {}).get("cwd") == "/srv/work",
+    str(_task_env_overrides.get("agent:main:familiar:dm:default")),
+)
+check(
+    "and says it is the session's own workspace, not wherever the gateway was launched",
+    _task_env_overrides.get("agent:main:familiar:dm:default", {}).get("cwd_source") == "session",
+    str(_task_env_overrides.get("agent:main:familiar:dm:default")),
+)
+
 asyncio.run(live._handle_ingress(_FakeRequest({"action": "something-not-invented-here", "channel": "default"})))
 check(
     "an action this plugin does not know is ignored rather than guessed at",
