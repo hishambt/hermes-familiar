@@ -160,7 +160,10 @@ print("\ndelivery")
 result = send(live, metadata={"job_id": JOB_ID})
 check("reports success", result.success is True, str(result.error))
 check("keeps the id Familiar returned", result.message_id == "notif_1", str(result.message_id))
-check("posts to the documented path", RECEIVED[-1]["path"] == "/api/hermes/notifications", RECEIVED[-1]["path"])
+# A reply is a MESSAGE, not a job delivery: since the channel carries the chat, what send() posts must not
+# land in the notification list an operator reads cron output from.
+check("posts a reply to the message path, not the notification list",
+      RECEIVED[-1]["path"] == "/api/hermes/message", RECEIVED[-1]["path"])
 check("sends the bearer token", RECEIVED[-1]["auth"] == "Bearer tok_abc123", str(RECEIVED[-1]["auth"]))
 payload = RECEIVED[-1]["json"]
 check("instance", payload["instance"] == "homelab", str(payload))
@@ -195,7 +198,54 @@ check(
 )
 check("and says so", RECEIVED[-1]["json"]["truncated"] is True)
 
-# 4. Failures.
+# 4. The conversation's session: the one fact only this process can produce.
+print("\nsession")
+
+
+class _FakeEntry:
+    def __init__(self, key, session_id):
+        self.session_key = key
+        self.session_id = session_id
+
+
+class _FakeStore:
+    """The routing index, which is the only thing that knows which SESSION an address is on."""
+
+    def __init__(self):
+        self.current = "20261005_120000_abcdef12"
+        self.switched_to = []
+
+    def get_or_create_session(self, source):
+        return _FakeEntry("agent:main:familiar:dm:" + str(source.chat_id), self.current)
+
+    def switch_session(self, key, target):
+        self.switched_to.append(target)
+        self.current = target
+        return _FakeEntry(key, target)
+
+    def peek_session_id(self, key):
+        return self.current
+
+
+store = _FakeStore()
+live.set_session_store(store)
+source = live.build_source(
+    chat_id="default", chat_name="default", chat_type="dm", user_id="familiar", user_name="Familiar")
+
+check("the ingress names the session the address is on",
+      asyncio.run(live._resolve_session(source)) == "20261005_120000_abcdef12")
+check("a reply carries it, so a client can follow where its conversation went",
+      live._current_session_id("default") == "20261005_120000_abcdef12")
+store.current = "20261005_130000_99999999"
+check("and it is read per reply, so a rotation DURING the turn is already reflected",
+      live._current_session_id("default") == "20261005_130000_99999999")
+check("a declared session is adopted, which is how a fork is carried on",
+      asyncio.run(live._resolve_session(source, declared="20261005_090000_forked01")) == "20261005_090000_forked01")
+check("by pointing the key at it, the move /resume makes", store.switched_to == ["20261005_090000_forked01"])
+asyncio.run(live._resolve_session(source, declared="20261005_090000_forked01"))
+check("and one already on the key is left alone", store.switched_to == ["20261005_090000_forked01"])
+
+# 5. Failures.
 print("\nfailures")
 REPLY.update({"code": 401, "body": json.dumps({"message": "invalid token"})})
 refused = send(live)
