@@ -27,6 +27,7 @@ blocks the gateway's event loop.
 
 from __future__ import annotations
 
+import time
 import asyncio
 import json
 import logging
@@ -48,6 +49,11 @@ DEFAULT_TARGET = "default"
 NOTIFY_PATH = "/api/hermes/notifications"
 #: Where the agent's asks go: a clarify question, and a command approval. Same convention as the
 #: notification path - one base URL, one path per kind of thing being delivered.
+#: The answer to a confirmation this adapter raised: ``cf:<confirm_id>:<once|cancel>``. The gateway's own
+#: text fallback spells these as commands (``/approve``, ``/cancel``); this is the same answer without
+#: relying on a message that is not a message becoming one.
+CONFIRM_PREFIX = "cf:"
+
 ASK_PATH = "/api/hermes/ask"
 #: Where Familiar posts what a person said, and the answers to the asks above. One route for both:
 #: the gateway routes a message that arrives while a run is parked to the clarify intercept.
@@ -198,6 +204,7 @@ def _ask_payload(
 	callback_prefix: str,
 	command: Optional[str] = None,
 	description: Optional[str] = None,
+	expires_in: Optional[int] = None,
 ) -> Dict[str, Any]:
 	"""What Familiar receives when the agent needs an answer.
 
@@ -219,6 +226,9 @@ def _ask_payload(
 		"requestId": request_id,
 		"sessionKey": session_key,
 		"callbackPrefix": callback_prefix,
+		# Seconds left on the hold, when the gateway put one on it. A countdown the client runs from a duration
+		# survives the two clocks disagreeing; an absolute time would not.
+		"expiresIn": expires_in,
 	}
 
 
@@ -272,6 +282,10 @@ class FamiliarAdapter(BasePlatformAdapter):
 		# knows which SESSION an address is on, and it is the gateway's, so it has to be asked per reply rather
 		# than remembered: /new, /reset and a compression rotation all move the key to another session.
 		self._session_keys: Dict[str, str] = {}
+		# confirm_id -> (session_key, chat_id): what answering a confirmation this adapter raised resolves, and
+		# where to say so. The pending hold itself lives in the gateway (``tools.slash_confirm``), so this is
+		# only the address of the answer.
+		self._confirms: Dict[str, Any] = {}
 		# The lifted HomeChannel is the canonical store; extra and the env are the fallbacks.
 		self._home: str = (
 			str(getattr(config.home_channel, "chat_id", "") or "")
@@ -379,6 +393,13 @@ class FamiliarAdapter(BasePlatformAdapter):
 		chat_id = str(payload.get("channel") or payload.get("chatId") or self._home or DEFAULT_TARGET)
 		if not text:
 			return web.json_response({"error": "missing text"}, status=400)
+
+		# An answer to a confirmation this adapter raised. It is not something the reader SAID, so it must not
+		# become a turn: it belongs to the hold, and it is resolved here.
+		if text.startswith(CONFIRM_PREFIX):
+			await self._resolve_confirm(text, chat_id)
+
+			return web.json_response({"ok": True})
 
 		source = self.build_source(
 			chat_id=chat_id,
@@ -494,6 +515,87 @@ class FamiliarAdapter(BasePlatformAdapter):
 			return SendResult(success=False, error=str(error), retryable=error.retryable)
 
 		return SendResult(success=True, message_id=clarify_id or None)
+
+	async def send_slash_confirm(
+		self,
+		chat_id: str,
+		title: str = "",
+		message: str = "",
+		session_key: str = "",
+		confirm_id: str = "",
+		**kwargs: Any,
+	) -> SendResult:
+		"""Carry the gateway's own confirmation to Familiar, and remember what answering it resolves.
+
+		The gateway holds a command it will not take back - starting a fresh session, clearing, an undo - until
+		this is answered. Familiar shows it as a decision of its own rather than as part of a turn, so the reader
+		gets Approve and Cancel, and no "always": that is a persisted gateway setting, and a setting belongs to a
+		settings page rather than to a question asked in a chat.
+
+		The hold EXPIRES, and the remaining time travels with the ask - read from the gateway's own clock rather
+		than assumed, so the countdown the reader sees is the one that is actually running.
+		"""
+		if not self._token:
+			return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
+
+		command = title
+		expires_in: Optional[int] = None
+		try:
+			from tools import slash_confirm as _slash_confirm
+
+			pending = _slash_confirm.get_pending(session_key)
+			if pending and str(pending.get("confirm_id") or "") == str(confirm_id or ""):
+				command = str(pending.get("command") or "") or title
+				elapsed = time.time() - float(pending.get("created_at") or 0)
+				expires_in = max(0, int(_slash_confirm.DEFAULT_TIMEOUT_SECONDS - elapsed))
+		except Exception as error:  # noqa: BLE001 - an ask without a clock on it still beats no ask
+			logger.debug("[%s] could not read the confirmation's remaining time: %s", self.name, error)
+
+		self._confirms[str(confirm_id)] = (session_key, chat_id or self._home)
+		payload = _ask_payload(
+			self._instance,
+			chat_id or self._home,
+			"confirm",
+			message,
+			["once", "cancel"],
+			confirm_id,
+			session_key,
+			"cf",
+			command=command if command.startswith("/") else (f"/{command}" if command else None),
+			expires_in=expires_in,
+		)
+		try:
+			await asyncio.to_thread(_post, self._url, self._token, payload, ASK_PATH)
+		except _DeliveryError as error:
+			logger.warning("[%s] Confirmation failed: %s", self.name, error)
+			return SendResult(success=False, error=str(error), retryable=error.retryable)
+
+		return SendResult(success=True, message_id=str(confirm_id) or None)
+
+	async def _resolve_confirm(self, text: str, chat_id: str) -> None:
+		"""Resolve the confirmation the reader answered, and say what happened either way.
+
+		Answering it here rather than handing it to the gateway is deliberate: the hold is module state inside
+		this process, and the outcome of resolving it is a reply in this conversation. An expired hold resolves
+		to nothing, and the honest answer to a tap that arrived too late is that nothing was done.
+		"""
+		parts = text.split(":", 2)
+		confirm_id = parts[1] if len(parts) > 1 else ""
+		choice = parts[2] if len(parts) > 2 else ""
+		remembered = self._confirms.pop(confirm_id, None)
+		if not remembered:
+			await self.send(chat_id, "That confirmation is no longer waiting, so nothing was done.")
+
+			return
+		session_key, _ = remembered
+		try:
+			from tools import slash_confirm as _slash_confirm
+
+			answer = await _slash_confirm.resolve(session_key, confirm_id, choice)
+		except Exception as error:  # noqa: BLE001 - a failed resolve is still an answer the reader needs
+			logger.warning("[%s] Could not resolve the confirmation: %s", self.name, error)
+			answer = None
+		await self.send(chat_id, answer or "That confirmation is no longer waiting, so nothing was done.")
 
 	async def send_exec_approval(
 		self,
