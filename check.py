@@ -198,6 +198,18 @@ check(
 )
 check("and says so", RECEIVED[-1]["json"]["truncated"] is True)
 
+# 4b. The build, so "did my update land?" is answered by looking rather than by guessing.
+manifest_version = next(
+    line.split(":", 1)[1].strip()
+    for line in (Path(PLUGIN_DIR) / "plugin.yaml").read_text(encoding="utf-8").split("\n")
+    if line.startswith("version:")
+)
+check(
+    "a delivery says which build this instance is running",
+    RECEIVED[-1]["json"]["pluginVersion"] == manifest_version,
+    "%s vs %s" % (RECEIVED[-1]["json"].get("pluginVersion"), manifest_version),
+)
+
 # 4. The conversation's session: the one fact only this process can produce.
 print("\nsession")
 
@@ -329,6 +341,7 @@ check("as a clarify", clarify["json"]["kind"] == "clarify", str(clarify["json"].
 check("carrying the id its answer comes back with", clarify["json"]["requestId"] == "cl_1", str(clarify["json"].get("requestId")))
 check("and the choices the reader picks from", clarify["json"]["choices"] == ["postgres", "sqlite"], str(clarify["json"].get("choices")))
 check("under the prefix every adapter shares", clarify["json"]["callbackPrefix"] == "cl", str(clarify["json"].get("callbackPrefix")))
+check("an ask says it too, so a quiet instance is still identifiable", clarify["json"]["pluginVersion"] == manifest_version, str(clarify["json"].get("pluginVersion")))
 
 asyncio.run(
     live.send_exec_approval(

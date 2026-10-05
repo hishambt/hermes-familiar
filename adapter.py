@@ -47,14 +47,37 @@ logger = logging.getLogger(__name__)
 DEFAULT_URL = "http://127.0.0.1:3100"
 DEFAULT_TARGET = "default"
 NOTIFY_PATH = "/api/hermes/notifications"
-#: Where the agent's asks go: a clarify question, and a command approval. Same convention as the
-#: notification path - one base URL, one path per kind of thing being delivered.
-#: The answer to a confirmation this adapter raised: ``cf:<confirm_id>:<once|cancel>``. The gateway's own
-#: text fallback spells these as commands (``/approve``, ``/cancel``); this is the same answer without
-#: relying on a message that is not a message becoming one.
+#: Where the agent's asks go: a clarify question, an approval, and the gateway's own confirmation. Same
+#: convention as the notification path - one base URL, one path per kind of thing being delivered.
+ASK_PATH = "/api/hermes/ask"
+
+#: The answer to a confirmation this adapter raised: ``cf:<confirm_id>:<once|cancel>``. The gateway's own text
+#: fallback spells these as commands (``/approve``, ``/cancel``); this is the same answer without relying on a
+#: message that is not a message becoming one.
 CONFIRM_PREFIX = "cf:"
 
-ASK_PATH = "/api/hermes/ask"
+
+def _plugin_version() -> str:
+	"""The build this plugin is, read from its own manifest.
+
+	One place names a build, and it is the place an operator edits, so what an instance reports cannot drift
+	from what was installed. That is the point: "did my update land?" is otherwise answered by guessing, and a
+	stale plugin and a broken one look alike from the other end of a connection.
+	"""
+	try:
+		manifest = (Path(__file__).resolve().parent / "plugin.yaml").read_text(encoding="utf-8")
+
+		for line in manifest.split("\n"):
+			if line.startswith("version:"):
+				return line.split(":", 1)[1].strip().strip('"').strip("'")
+	except Exception as error:  # noqa: BLE001 - a version is worth having, not worth failing over
+		logger.debug("[familiar] could not read the plugin's own version: %s", error)
+
+	return "unknown"
+
+
+#: Reported with everything this plugin sends, so the app can say which build an instance is running.
+PLUGIN_VERSION = _plugin_version()
 #: Where Familiar posts what a person said, and the answers to the asks above. One route for both:
 #: the gateway routes a message that arrives while a run is parked to the clarify intercept.
 #: Where the agent's reply goes. A reply in a conversation is not a job delivery, so it must not land
@@ -147,6 +170,7 @@ def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[s
 	return {
 		"instance": instance,
 		"target": target,
+		"pluginVersion": PLUGIN_VERSION,
 		"content": content[:MAX_MESSAGE_LENGTH],
 		"truncated": truncated,
 		"jobId": str(job_id) if job_id else None,
@@ -216,6 +240,7 @@ def _ask_payload(
 	return {
 		"instance": instance,
 		"target": target,
+		"pluginVersion": PLUGIN_VERSION,
 		"kind": kind,
 		"body": body,
 		"choices": choices or [],

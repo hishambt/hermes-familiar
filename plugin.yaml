@@ -1,7 +1,7 @@
 name: familiar-platform
 label: Familiar
 kind: platform
-version: 2.0.0
+version: 2.1.0
 description: >
   Delivery-only gateway platform that pushes Hermes output to a Familiar client's notifications, over HTTP.
 
