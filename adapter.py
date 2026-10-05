@@ -250,6 +250,11 @@ class FamiliarAdapter(BasePlatformAdapter):
 	# A person IS there: Familiar has an ingress now, so a prompt asking whether to resume an interrupted turn
 	# lands in front of someone who can answer it. Both flags are read generically by the gateway.
 	interactive_resume = True
+
+	# A channel, not a chat app: Familiar cannot EDIT a message it was sent, so it must not be streamed into.
+	# The gateway's default here is True, which built a stream consumer for Familiar, pushed the reply into a
+	# message nobody could update, and then counted the turn as delivered - so the answer never arrived.
+	SUPPORTS_MESSAGE_EDITING = False
 	supports_async_delivery = False
 
 	def __init__(self, config: PlatformConfig) -> None:
@@ -385,11 +390,24 @@ class FamiliarAdapter(BasePlatformAdapter):
 			message_id=str(payload.get("messageId") or "") or None,
 		)
 
+		# A missing handler makes handle_message a silent no-op, and this endpoint answers "accepted" either
+		# way - so say so instead of accepting a message that can never become a turn.
+		if not getattr(self, "_message_handler", None):
+			logger.error("[familiar] a message arrived but the gateway never registered a message handler for "
+			             "this adapter, so no turn can start")
+			return web.json_response({"accepted": False, "reason": "no message handler"}, status=503)
+
 		# Dispatched as a task, as every adapter does it: the turn can take minutes, and the caller - Familiar -
 		# is waiting on a prompt HTTP response, not on the agent.
 		task = asyncio.create_task(self.handle_message(event))
+
+		def _report(task: "asyncio.Task") -> None:
+			self._background_tasks.discard(task)
+			if not task.cancelled() and task.exception() is not None:
+				logger.error("[familiar] the turn from the ingress failed: %s", task.exception())
+
 		self._background_tasks.add(task)
-		task.add_done_callback(self._background_tasks.discard)
+		task.add_done_callback(_report)
 
 		return web.json_response({"accepted": True, "messageId": event.message_id})
 
@@ -533,6 +551,11 @@ def register(ctx) -> None:
 		# This is the line that makes `deliver: familiar` a job target: the scheduler reads the home channel
 		# from this env var name when a job asks for the bare platform.
 		cron_deliver_env_var="FAMILIAR_HOME_CHANNEL",
+		# Who may speak to the agent through this channel. Without these the gateway reads every inbound message as
+		# an unknown user and refuses it - "Unauthorized user: familiar (Familiar)" - which is exactly what it was
+		# doing, so a message arrived and then went nowhere.
+		allowed_users_env="FAMILIAR_ALLOWED_USERS",
+		allow_all_env="FAMILIAR_ALLOW_ALL_USERS",
 		standalone_sender_fn=_standalone_send,
 		# 0 = the router does not chunk: one delivery becomes one notification, and the adapter truncates
 		# rather than turning a long brief into a burst of them.
