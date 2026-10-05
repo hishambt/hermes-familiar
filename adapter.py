@@ -162,7 +162,7 @@ def _post(url: str, token: str, payload: Dict[str, Any], path: str = NOTIFY_PATH
 		headers={
 			"Content-Type": "application/json",
 			"Authorization": f"Bearer {token}",
-			"User-Agent": f"hermes-familiar-notify/1.0 (instance:{payload['instance']})",
+			"User-Agent": f"hermes-familiar (instance:{payload['instance']})",
 		},
 	)
 	try:

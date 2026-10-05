@@ -5,7 +5,7 @@ path, bearer header, payload - and how each failure came back. It imports `gatew
 live in the Hermes install, so run it with that install's interpreter and from that directory:
 
     cd "$LOCALAPPDATA/hermes/hermes-agent"
-    ./venv/Scripts/python.exe "C:/Work/Personal/Familiar/hermes-familiar-notify/check.py"
+    ./venv/Scripts/python.exe "C:/Work/Personal/Familiar/hermes-familiar/check.py"
 
 Nothing here touches the real ~/.hermes: HERMES_HOME is pointed at a temp directory first.
 """
