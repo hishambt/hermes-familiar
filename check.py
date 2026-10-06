@@ -317,6 +317,61 @@ check(
 )
 adapter._clear_token()  # and the check leaves nothing behind where it moved it to
 
+# The jobs list is a PAGE of what this machine has scheduled, sorted by the column the reader clicked. The app's
+# table asks for what it shows, so a machine with a hundred jobs answers with ten - and the sort travels with the
+# question rather than the app holding every row to sort them itself.
+print("\nthe jobs a machine lists")
+
+
+class _FakeCron:
+	"""The machine's job store, with enough in it to page and to sort."""
+
+	@staticmethod
+	def list(include_disabled: bool = False) -> list:
+		_ = include_disabled
+
+		return [
+			{"id": "c", "name": "Charlie", "last_run": "2026-01-03T00:00:00+00:00"},
+			{"id": "a", "name": "Alpha", "last_run": None},
+			{"id": "b", "name": "Bravo", "last_run": "2026-01-02T00:00:00+00:00"},
+		]
+
+
+def _jobs(query: str) -> dict:
+	parsed: Dict[str, List[str]] = {}
+
+	for pair in query.split("&"):
+		if pair:
+			key, _, value = pair.partition("=")
+			parsed.setdefault(key, []).append(value)
+
+	return asyncio.run(live._api_list_jobs({}, parsed, None))["body"]
+
+
+_cron_before = live._cron
+live._cron = lambda: {"list": _FakeCron.list}
+
+_first = _jobs("limit=2")
+check("a page is what was asked for, not the whole list", len(_first["data"]) == 2, str(_first["data"]))
+check("and it says how many there are in all", _first["total"] == 3, str(_first["total"]))
+check("and that there is another page", _first["has_more"] is True, str(_first["has_more"]))
+
+_rest = _jobs("limit=2&offset=2")
+check("the second page is the rest of it", [job["name"] for job in _rest["data"]] == ["Bravo"], str(_rest["data"]))
+check("and the last page knows it is the last", _rest["has_more"] is False, str(_rest["has_more"]))
+
+_sorted = _jobs("sort=name&order=desc")
+check(
+	"a sort the reader clicked comes back in that order",
+	[job["name"] for job in _sorted["data"]] == ["Charlie", "Bravo", "Alpha"],
+	str([job["name"] for job in _sorted["data"]]),
+)
+
+_searched = _jobs("search=brav")
+check("and a search is a page of the matches", [job["name"] for job in _searched["data"]] == ["Bravo"], str(_searched["data"]))
+
+live._cron = _cron_before
+
 # 3. A delivery, and what the receiver sees.
 print("\ndelivery")
 result = send(live, metadata={"job_id": JOB_ID})
