@@ -67,9 +67,6 @@ CHANNEL_PAIR_WAIT_PATH = "/api/channel/pair/wait"
 #: What a paired machine answers out of its OWN state. These are the paths the app already reads over an
 #: instance's HTTP API, answered from Hermes' own store and in the same shape - because the app parses one
 #: shape, and a second one would be a second source of truth. A path that is not here is refused by name.
-#: What a paired machine answers out of its OWN state. These are the paths the app already reads over an
-#: instance's HTTP API, answered from Hermes' own store and in the same shape - because the app parses one
-#: shape, and a second one would be a second source of truth. A path that is not here is refused by name.
 _API_ROUTES = (
 	("GET", r"/api/sessions", "_api_list_sessions"),
 	("GET", r"/api/sessions/(?P<session>[^/]+)/messages", "_api_session_messages"),

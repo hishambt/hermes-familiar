@@ -23,7 +23,7 @@ from pathlib import Path
 PLUGIN_DIR = str(Path(__file__).resolve().parent)
 
 # A temp home, so nothing here reads or writes the real ~/.hermes.
-os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="familiar-notify-test-")
+os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="familiar-platform-test-")
 sys.path.insert(0, PLUGIN_DIR)
 
 RECEIVED: list = []
