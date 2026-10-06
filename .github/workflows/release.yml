@@ -1,0 +1,60 @@
+name: release
+
+# A tag is the release, so nothing has to be remembered.
+#
+# The asset is built with `git archive` from the tagged commit, which matters twice: it carries the committed
+# bytes (this repository is LF on every platform, and a plain checkout would not guarantee that), and its
+# `--prefix` puts the plugin's own directory name at the top level, so unpacking into `~/.hermes/plugins/` lands
+# the files exactly where `hermes plugins enable` looks for them. GitHub's automatic source archive has neither
+# property, which is why this asset exists at all.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: The tag has to be the version the manifest declares
+        run: |
+          set -euo pipefail
+          manifest="$(sed -n 's/^version:[[:space:]]*//p' plugin.yaml | head -1)"
+          tag="${GITHUB_REF_NAME#v}"
+          echo "manifest $manifest, tag $tag"
+          if [ "$manifest" != "$tag" ]; then
+            echo "::error::plugin.yaml declares $manifest but this tag says $tag"
+            exit 1
+          fi
+
+      - name: Build the archive a reader unpacks
+        run: |
+          set -euo pipefail
+          git archive --prefix=familiar-platform/ --format=zip -o familiar-platform.zip "$GITHUB_REF_NAME"
+          python3 - <<'PY'
+          import zipfile
+          names = zipfile.ZipFile('familiar-platform.zip').namelist()
+          print('\n'.join(names))
+          top = {name.split('/')[0] for name in names}
+          assert top == {'familiar-platform'}, f'top level is {top}, not the plugin directory name'
+          print('top level is familiar-platform/ as required')
+          PY
+          sha256sum familiar-platform.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$GITHUB_REF_NAME" \
+            familiar-platform.zip SHA256SUMS \
+            --title "Familiar plugin ${GITHUB_REF_NAME#v}" \
+            --generate-notes

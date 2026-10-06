@@ -4,8 +4,8 @@ Runs against a stub HTTP receiver on loopback, so the assertions are about what 
 path, bearer header, payload - and how each failure came back. It imports `gateway.*` and `cron.*`, which
 live in the Hermes install, so run it with that install's interpreter and from that directory:
 
-    cd "$LOCALAPPDATA/hermes/hermes-agent"
-    ./venv/Scripts/python.exe "C:/Work/Personal/Familiar/hermes-familiar/check.py"
+    cd "$LOCALAPPDATA/hermes/hermes-agent"                    # ~/.hermes/hermes-agent on Linux
+    ./venv/Scripts/python.exe /path/to/hermes-familiar/check.py   # venv/bin/python on Linux
 
 Nothing here touches the real ~/.hermes: HERMES_HOME is pointed at a temp directory first.
 """

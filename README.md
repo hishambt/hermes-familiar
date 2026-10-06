@@ -1,9 +1,28 @@
 # hermes-familiar
 
-A Hermes plugin that makes a machine a [Familiar](https://github.com/hishambt/familiar-frontend) client's
+A Hermes plugin that makes a machine a Familiar client's
 channel: it delivers output to the client's notifications, carries a person's message into the agent, and
 answers what the client asks about this machine's own conversations. Runs on the machine Hermes runs on.
-Standard library only.
+Standard library only, MIT licensed.
+
+## Install
+
+```bash
+hermes plugins install hishambt/hermes-familiar --enable
+```
+
+That is the whole of it on a machine that has `git` and a way out to GitHub. For one without either, unpack the
+archive from the [latest release](https://github.com/hishambt/hermes-familiar/releases/latest) into the
+directory Hermes reads plugins from. The archive's own top level is `familiar-platform/`, so it lands exactly
+where `hermes plugins enable` looks:
+
+```bash
+unzip -o familiar-platform.zip -d ~/.hermes/plugins/
+hermes plugins enable familiar-platform
+```
+
+Either way the plugin is in place and pointed nowhere yet: the settings and the pairing code are under
+[Setup](#setup).
 
 ## Why it exists
 
@@ -82,9 +101,10 @@ one that takes arguments:
 
 ## Setup
 
-**A machine Familiar has a shell on needs none of this.** Familiar's own setup finds Hermes, writes the plugin,
-enables it, sets all three settings below and restarts the gateway, and the machine reports itself back. What
-follows is for a machine Familiar has no shell on, or for a reader doing it by hand.
+**A machine Familiar has a shell on needs none of this.** Familiar's own setup finds Hermes and runs the
+install above on that machine, enables it, sets all three settings below and restarts the gateway, and the
+machine reports itself back. What follows is for a machine Familiar has no shell on, or for a reader doing it
+by hand.
 
 The token is the one thing not set by hand: it is issued when the machine **pairs**. Install and enable the
 plugin, point it at where Familiar is with `FAMILIAR_URL`, restart the gateway - and the machine shows a code
@@ -124,8 +144,8 @@ then delivers to a stub receiver on loopback and reads what arrived (path, beare
 401, a 503 and an unreachable host each come back). Run it from the Hermes install, with its own interpreter:
 
 ```bash
-cd "$LOCALAPPDATA/hermes/hermes-agent"
-./venv/Scripts/python.exe "C:/Work/Personal/Familiar/hermes-familiar/check.py"
+cd "$LOCALAPPDATA/hermes/hermes-agent"                    # ~/.hermes/hermes-agent on Linux
+./venv/Scripts/python.exe /path/to/hermes-familiar/check.py   # venv/bin/python on Linux
 ```
 
 ## Settings
