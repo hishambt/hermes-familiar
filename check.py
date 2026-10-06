@@ -282,6 +282,41 @@ check(
 adapter._clear_token()
 check("and the check leaves no pairing behind", not adapter._state_path().exists())
 
+# The token has to survive an UPDATE, and an update is `plugins install --force`: it removes this plugin's whole
+# directory and lays a new one down. Beside the plugin is therefore the one place this state cannot live.
+module_file = adapter.__file__
+plugin_dir = Path(module_file).resolve().parent
+state_path = adapter._state_path().resolve()
+check("the pairing is not kept inside the plugin directory", plugin_dir not in state_path.parents, str(state_path))
+check(
+    "and lives under Hermes' home instead",
+    state_path.parent == Path(os.environ["HERMES_HOME"]).resolve() / adapter.STATE_DIR,
+    str(state_path),
+)
+
+# An install from before this change kept it beside the plugin, and that file is found and MOVED - once: a machine
+# that already paired must not pair again because the plugin learned where to put things.
+with tempfile.TemporaryDirectory() as legacy_where:
+    adapter.__file__ = str(Path(legacy_where) / "adapter.py")
+    Path(adapter.__file__).write_text("", encoding="utf-8")
+    (Path(legacy_where) / adapter.STATE_FILE).write_text(json.dumps({"token": "tok_legacy"}), encoding="utf-8")
+
+    adopted = adapter._load_token()
+    # Where the plugin SAYS its state is, rather than recomputing it from the environment: the home is resolved once
+    # at import, so a check that recomputed it would be checking something the plugin never looks at.
+    where_now = adapter._state_path().resolve()
+    left_behind = (Path(legacy_where) / adapter.STATE_FILE).exists()
+
+    adapter.__file__ = module_file
+
+check("a pairing kept beside the plugin is still found", adopted == "tok_legacy", adopted)
+check(
+    "and moved to where this plugin keeps its state, so the next update keeps it",
+    where_now.exists() and not left_behind and plugin_dir not in where_now.parents,
+    f"at={where_now} exists={where_now.exists()} left_behind={left_behind}",
+)
+adapter._clear_token()  # and the check leaves nothing behind where it moved it to
+
 # 3. A delivery, and what the receiver sees.
 print("\ndelivery")
 result = send(live, metadata={"job_id": JOB_ID})

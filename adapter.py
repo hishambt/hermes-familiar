@@ -35,6 +35,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import os
 import re
 import urllib.error
 import urllib.parse
@@ -104,9 +105,11 @@ _JOB_UPDATE_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill"
 _MAX_JOB_NAME = 200
 _MAX_JOB_PROMPT = 5000
 
-#: Where a paired machine keeps the token it was given. Beside the plugin, because it belongs to the INSTALL and
-#: not to a Hermes config: nothing a reader edits by hand should hold a credential that arrives by pairing.
+#: What a paired machine's state is called. Where it lives is `_state_path`.
 STATE_FILE = "state.json"
+
+#: The directory this plugin keeps that state in, under Hermes' home rather than inside the plugin.
+STATE_DIR = "familiar-platform"
 
 #: A connection that drops is retried: the far end restarting is not a reason to give up. Backing off, because a
 #: machine that reconnects in a tight loop is a machine nobody can use.
@@ -122,8 +125,57 @@ CONFIRM_PREFIX = "cf:"
 PAIR_PATH = "/familiar/pair"
 
 
+def _state_home() -> Path:
+	"""Hermes' own home, which is where a plugin's state belongs.
+
+	Asked of Hermes rather than read off the environment: the home is profile-aware, so a machine running two profiles
+	keeps two pairings, which is what having two profiles means. The env var is the fallback for an older Hermes that
+	does not offer the function - it is where that home lives anyway.
+	"""
+	try:
+		from hermes_constants import get_hermes_home
+
+		return Path(get_hermes_home()) / STATE_DIR
+	except Exception:  # noqa: BLE001 - an import that fails must not cost the machine its pairing
+		return Path(os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))) / STATE_DIR
+
+
 def _state_path() -> Path:
-	return Path(__file__).resolve().parent / STATE_FILE
+	"""Where the token and the remembered refusal live.
+
+	Under Hermes' home, NOT beside the plugin. Beside the plugin is where this started, and it is the one place an
+	update is guaranteed to destroy: `plugins install --force` removes this plugin's whole directory and lays a new
+	one down, so every update threw the token away and every machine had to pair again - a step with no meaning for
+	the reader, who had done nothing to lose it. Not in a Hermes config either: a credential that arrives by pairing
+	has no business in a file a reader edits by hand.
+
+	A state file from before this change is still found and MOVED, once: a machine that already paired must not have
+	to pair again because the plugin learned where to put things.
+	"""
+	path = _state_home() / STATE_FILE
+
+	if path.exists():
+		return path
+
+	legacy = Path(__file__).resolve().parent / STATE_FILE
+
+	if legacy.exists():
+		try:
+			path.parent.mkdir(parents=True, exist_ok=True)
+			legacy.replace(path)
+
+			return path
+		except Exception as error:  # noqa: BLE001 - an old file that will not move still beats no token at all
+			logger.warning("[familiar] could not move this machine's pairing out of the plugin directory: %s", error)
+
+			return legacy
+
+	try:
+		path.parent.mkdir(parents=True, exist_ok=True)
+	except Exception:  # noqa: BLE001 - a home that will not take a directory fails loudly on the write instead
+		pass
+
+	return path
 
 
 def _load_token() -> str:

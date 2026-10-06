@@ -114,8 +114,9 @@ Two places have it, and both are on that machine: the log, at the moment it is m
 `http://127.0.0.1:8644/familiar/pair`, which answers with the code while this machine is unpaired and
 `paired: true` once it is not. If the code has not arrived yet it is asked for and waited on, so one command is
 enough: nothing here needs running twice to get an answer. Claiming that code in Familiar creates the instance and hands the machine its
-token, which it keeps beside the plugin so a restart does not lose it. Setting `FAMILIAR_TOKEN` by hand instead
-works, but a pairing replaces it.
+token. It keeps it under Hermes' own home - `~/.hermes/familiar-platform/state.json`, never inside this
+plugin's directory, which an update replaces outright: a pairing thrown away by an update is a machine made to pair
+again for no reason. Setting `FAMILIAR_TOKEN` by hand instead works, but a pairing replaces it.
 
 **Deleting the instance is not the end of that machine.** It keeps the token it was given, so Familiar refuses
 its next connection - and a machine that is refused drops that token and pairs again, showing a new code in the
