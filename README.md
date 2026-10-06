@@ -116,6 +116,11 @@ Two places have it, and both are on that machine: the log, at the moment it is m
 token, which it keeps beside the plugin so a restart does not lose it. Setting `FAMILIAR_TOKEN` by hand instead
 works, but a pairing replaces it.
 
+**Deleting the instance is not the end of that machine.** It keeps the token it was given, so Familiar refuses
+its next connection - and a machine that is refused drops that token and pairs again, showing a new code in the
+same two places. A token the machine was configured with (`FAMILIAR_TOKEN`) is remembered as refused rather than
+deleted, so a corrected value is still honoured the moment it changes.
+
 **If nothing answers on 8644**, the plugin did not load or something else on that machine holds the port. The
 gateway log says which (`ingress could not bind 127.0.0.1:8644`), and a machine that pairs and delivers while
 its ingress is down still cannot take a message through it. Move it with `FAMILIAR_INGRESS_PORT` (and

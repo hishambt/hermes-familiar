@@ -14,3 +14,6 @@ Thumbs.db
 
 # Local scratch
 *.log
+
+# The pairing a machine keeps beside the plugin, written at runtime
+state.json

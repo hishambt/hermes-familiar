@@ -14,6 +14,7 @@ import asyncio
 import contextlib
 import json
 import os
+import socket
 import sys
 import tempfile
 import threading
@@ -24,6 +25,21 @@ PLUGIN_DIR = str(Path(__file__).resolve().parent)
 
 # A temp home, so nothing here reads or writes the real ~/.hermes.
 os.environ["HERMES_HOME"] = tempfile.mkdtemp(prefix="familiar-platform-test-")
+
+
+def _free_port() -> int:
+    """A port nothing is using, for the ingress these checks bind.
+
+    Not the DEFAULT one: a machine already running this plugin holds 8644, so asserting against it would fail on
+    exactly the machines where the plugin is working - which is how this check first went red.
+    """
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        return int(probe.getsockname()[1])
+
+
+# Every machine below binds this one, and the checks that stand one up do not overlap.
+os.environ["FAMILIAR_INGRESS_PORT"] = str(_free_port())
 sys.path.insert(0, PLUGIN_DIR)
 
 RECEIVED: list = []
@@ -226,6 +242,35 @@ with without_env("FAMILIAR_TOKEN"):
         _adopted == "a-token-from-pairing",
         _adopted,
     )
+
+# 2b. A token this Familiar has refused, whichever place it came from.
+# A machine can hold two: the one pairing gave it, kept in its state file, and the one it was configured with.
+# Only the first is this plugin's to erase - the second is somebody's deliberate setting, so a refusal is
+# REMEMBERED against it. That is what makes "the instance was deleted, now connect it again" work at all: without
+# it the machine offers the same dead token forever, reports itself paired, and shows no code for anyone to type.
+print("\nthe token a machine presents")
+adapter._clear_token()  # a machine that has not paired
+check(
+    "a configured token is offered while nothing is paired",
+    live._presented_token() == "tok_abc123",
+    live._presented_token(),
+)
+adapter._mark_refused("tok_abc123")
+check(
+    "once Familiar refuses it, it is not offered again, so the machine pairs",
+    live._presented_token() == "",
+    repr(live._presented_token()),
+)
+probe = json.loads(asyncio.run(live._handle_pair_probe(None)).text)
+check("and the pair endpoint stops claiming to be paired", probe["paired"] is False, str(probe))
+adapter._save_token("a-token-from-pairing")
+check(
+    "a token from pairing wins over the configured one",
+    live._presented_token() == "a-token-from-pairing",
+    live._presented_token(),
+)
+adapter._clear_token()
+check("and the check leaves no pairing behind", not adapter._state_path().exists())
 
 # 3. A delivery, and what the receiver sees.
 print("\ndelivery")

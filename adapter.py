@@ -32,6 +32,7 @@ import time
 import uuid
 import asyncio
 import contextlib
+import hashlib
 import json
 import logging
 import re
@@ -140,6 +141,44 @@ def _clear_token() -> None:
 		_state_path().unlink(missing_ok=True)
 	except Exception as error:  # noqa: BLE001
 		logger.warning("[familiar] could not clear this machine's pairing: %s", error)
+
+
+def _token_hint(token: str) -> str:
+	"""A short, non-reversible name for a token, so a refusal can be remembered without keeping the token."""
+	return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
+
+
+def _load_refused() -> str:
+	"""The token this Familiar has already refused, as its hint, or an empty string.
+
+	Only ever a token that came from OUTSIDE this install - the environment or the config. The one pairing gave
+	us is deleted outright when it stops being accepted, so there is nothing to remember.
+	"""
+	try:
+		return str(json.loads(_state_path().read_text(encoding="utf-8")).get("refused") or "")
+	except Exception:  # noqa: BLE001 - no state, unreadable state: nothing has been refused
+		return ""
+
+
+def _mark_refused(token: str) -> None:
+	"""Remember that this machine must stop presenting a token it was configured with.
+
+	The token itself is somebody's deliberate setting and is not this plugin's to erase: what is written down is
+	that presenting it again would fail, scoped to THAT token's hint so a corrected value in the environment is
+	honoured the moment it changes. Without it a machine whose instance was deleted elsewhere retries the same
+	dead token forever - reporting ``paired: true``, showing no code, with no way back from the app.
+	"""
+	try:
+		state: Dict[str, Any] = {}
+
+		if _state_path().exists():
+			state = json.loads(_state_path().read_text(encoding="utf-8")) or {}
+
+		state["refused"] = _token_hint(token)
+		state.pop("token", None)
+		_state_path().write_text(json.dumps(state, indent="\t"), encoding="utf-8")
+	except Exception as error:  # noqa: BLE001 - worth a warning, not a crash
+		logger.warning("[familiar] could not record that a token was refused: %s", error)
 
 
 def _plugin_version() -> str:
@@ -479,6 +518,24 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 	# -- Connection lifecycle -----------------------------------------------
 
+	def _presented_token(self) -> str:
+		"""The token this machine offers: the one pairing gave it first, then the one it was configured with.
+
+		The pairing comes first because it belongs to THIS install and is newer than anything configured before it.
+		A refusal is remembered against the configured token's hint, so one this Familiar has already rejected is
+		not offered again - which is the whole difference between a machine that pairs again and one that sits
+		holding a dead token, showing no code and no way forward.
+		"""
+		stored = _load_token()
+
+		if stored:
+			return stored
+
+		if self._token and _token_hint(self._token) == _load_refused():
+			return ""
+
+		return self._token
+
 	def _take_token(self, token: str) -> None:
 		"""The token this machine was paired with, in both directions it is used.
 
@@ -566,7 +623,7 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 		while True:
 			try:
-				token = self._token or _load_token()
+				token = self._presented_token()
 
 				if not token:
 					await self._pair()
@@ -606,12 +663,20 @@ class FamiliarAdapter(BasePlatformAdapter):
 				},
 			) as response:
 				if response.status == 401:
-					# Not a token this Familiar knows: revoked, or this machine was unpaired elsewhere. Pairing again
-					# is the answer - but only for a token WE stored, because one from the environment is somebody's
-					# deliberate configuration and clearing it would fight them.
-					if _load_token():
+					# Not a token this Familiar knows: its instance was deleted, or the token was revoked. Pairing
+					# again is the answer, and it has to be reachable from BOTH places a token comes from - otherwise
+					# the machine is stuck, which is what a reader hits who deletes an instance and reconnects to a
+					# machine that still holds its token.
+					stored = _load_token()
+
+					if stored:
 						logger.warning("[familiar] this Familiar no longer accepts this machine's token; pairing again")
 						_clear_token()
+					elif self._token and _token_hint(self._token) != _load_refused():
+						logger.warning(
+							"[familiar] Familiar does not accept the token this machine was configured with; pairing again"
+						)
+						_mark_refused(self._token)
 
 					raise RuntimeError(f"the channel refused this machine's token (HTTP {response.status})")
 
@@ -1315,7 +1380,7 @@ class FamiliarAdapter(BasePlatformAdapter):
 		from aiohttp import web
 
 		return web.json_response({
-			"paired": bool(self._token),
+			"paired": bool(self._presented_token()),
 			"code": self._pair_code or None,
 			"version": PLUGIN_VERSION,
 		})
