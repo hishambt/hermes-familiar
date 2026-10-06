@@ -575,7 +575,14 @@ class FamiliarAdapter(BasePlatformAdapter):
 		async with aiohttp.ClientSession(timeout=timeout) as session:
 			async with session.get(
 				f"{self._url}{CHANNEL_STREAM_PATH}",
-				headers={"Authorization": f"Bearer {token}", "Accept": "text/event-stream"},
+				headers={
+					"Authorization": f"Bearer {token}",
+					"Accept": "text/event-stream",
+					# The build this machine runs, on EVERY connection rather than only when it pairs: the version
+					# column is the one thing that answers "did the update land?", and a machine set up over its
+					# shell never pairs at all - so a version sent only at pairing would never exist for it.
+					"X-Familiar-Plugin": PLUGIN_VERSION,
+				},
 			) as response:
 				if response.status == 401:
 					# Not a token this Familiar knows: revoked, or this machine was unpaired elsewhere. Pairing again
