@@ -1,7 +1,9 @@
 # hermes-familiar
 
-A Hermes plugin that delivers output to a [Familiar](https://github.com/hishambt/familiar-frontend) client's
-notifications. Runs on the machine Hermes runs on. Standard library only.
+A Hermes plugin that makes a machine a [Familiar](https://github.com/hishambt/familiar-frontend) client's
+channel: it delivers output to the client's notifications, carries a person's message into the agent, and
+answers what the client asks about this machine's own conversations. Runs on the machine Hermes runs on.
+Standard library only.
 
 ## Why it exists
 
@@ -12,8 +14,11 @@ For a client like Familiar the first one is the only useful answer.
 
 A cron `deliver` target is valid when it is a built-in platform name or a platform a plugin registered.
 Registering one with a **cron delivery env var** is what makes `deliver: familiar` a legal job target
-(`cron/scheduler_delivery.py`), and `send()` is the whole contract the delivery path needs. That is all this
-plugin is: a platform, a sender, and no way in.
+(`cron/scheduler_delivery.py`), and `send()` is the whole contract the delivery path needs.
+
+The other direction is the channel. A message from the client becomes a turn on this machine, the questions and
+permissions a turn raises reach the client with the id their answer comes back under, and the client's reads of
+this machine's conversations are answered here, out of Hermes' own state.
 
 ## How it works
 
@@ -111,8 +116,8 @@ cd "$LOCALAPPDATA/hermes/hermes-agent"
 
 - **Reach a remote instance.** The plugin runs where Hermes runs. Installing it on this machine changes
   nothing for a Hermes on another box; that box needs the plugin too.
-- **Receive.** There is no inbound path, by design: Familiar talks to an instance through the instance's own
-  API, so nothing here accepts a message, carries a turn, or offers a way in.
+- **Receive.** Only on this machine's own loopback. A message from Familiar arrives at the plugin's ingress,
+  or down the connection this machine holds, which is outbound. Nothing listens on a public interface.
 - **Deliver with no token.** Without `FAMILIAR_TOKEN` the platform stays disabled rather than failing
   deliveries quietly, and `send()` refuses with an error the caller can read.
 - **Guarantee exactly-once.** See the retry note above.
@@ -121,7 +126,7 @@ cd "$LOCALAPPDATA/hermes/hermes-agent"
 
 - The token is read per delivery and never logged, never echoed in an error, and never written into the
   plugin's own metadata on the instance. Errors name the status code and Familiar's response body only.
-- Nothing inbound means nothing to authorize: there are no allowed users, no chat allowlist, and no commands
-  reachable through this platform.
+- Everything inbound is authorized twice over: the ingress requires this instance's own token, and the gateway
+  refuses any sender who is not on `FAMILIAR_ALLOWED_USERS` (set `FAMILIAR_ALLOW_ALL_USERS` to widen it).
 - The default address is loopback. Pointing it at a hostname means the token travels over the network, so use
   HTTPS when it is not `127.0.0.1`.
