@@ -63,18 +63,43 @@ this machine's conversations are answered here, out of Hermes' own state.
   retries them. A retry can duplicate a delivery that in fact landed: dedupe on
   `(instance, jobId, content)` if that matters to you.
 
+## What a read can be asked for
+
+The client's reads of this machine's conversations are answered out of Hermes' own state, and the listing is the
+one that takes arguments:
+
+- `limit` / `offset` - a page. `limit` is clamped to 200, the same ceiling the API server uses.
+- `source` - one source's sessions (`cli`, `telegram`, `familiar`, ...).
+- `search` - free text, matched against a session's **title or id anywhere in its compression chain**. It is
+  applied in SQL **before** the page, so page two of a search is page two of the matches. This is the reason to
+  send it here rather than filter a page in the client, which can only ever answer about the page it holds.
+- `total` comes back with the rows: how many the filters admit. It is exact for a listing with no search (the
+  store's own count, over the same WHERE) and for a search that returns **short of** the window (an exhausted
+  search is its own count). A search that **fills** the window cannot be counted - the store counts without a
+  search term and nothing above it counts with one - so `total` is `null` there. Show what you have; do not
+  invent a number.
+
 ## Setup
 
-The intended path is Familiar's own Console, which runs Hermes commands on the machine its backend is on. Four
-cards, in this order:
+**A machine Familiar has a shell on needs none of this.** Familiar's own setup finds Hermes, writes the plugin,
+enables it, sets all three settings below and restarts the gateway, and the machine reports itself back. What
+follows is for a machine Familiar has no shell on, or for a reader doing it by hand.
+
+The token is the one thing not set by hand: it is issued when the machine **pairs**. Install and enable the
+plugin, point it at where Familiar is with `FAMILIAR_URL`, restart the gateway - and the machine shows a code
+(its log, and `http://127.0.0.1:8644/familiar/pair` on the machine itself). Claiming that code in Familiar
+creates the instance and hands the machine its token, which it keeps beside the plugin so a restart does not
+lose it. Setting `FAMILIAR_TOKEN` by hand instead works, but a pairing replaces it.
+
+Four cards in Familiar's Console, in this order:
 
 1. **Plugins → Install a plugin**: `hishambt/hermes-familiar`
 2. **Plugins → Enable a plugin**: `familiar-platform`
 3. **Configuration → Set a setting**:
-   - `FAMILIAR_TOKEN=<the token Familiar issued for this instance>` (the `_TOKEN` suffix is what routes it to
-     `.env` rather than `config.yaml`)
    - `platforms.familiar.extra.url=http://localhost:3100` when Familiar is not on the default address
    - `platforms.familiar.extra.instance=homelab` to label this instance in the notifications list
+   - `FAMILIAR_TOKEN=<the token Familiar issued for this instance>` only when wiring by hand rather than pairing
+     (the `_TOKEN` suffix is what routes it to `.env` rather than `config.yaml`)
 4. **This machine → Restart the gateway**, which is the re-discovery a plugin needs.
 
 From a terminal it is the same four steps:
@@ -82,8 +107,9 @@ From a terminal it is the same four steps:
 ```bash
 hermes plugins install hishambt/hermes-familiar
 hermes plugins enable familiar-platform
-hermes config set FAMILIAR_TOKEN <the token Familiar issued for this instance>
+hermes config set FAMILIAR_URL http://localhost:3100   # if Familiar is not on the default address
 hermes gateway restart
+curl -s http://127.0.0.1:8644/familiar/pair            # the code to claim in Familiar
 ```
 
 Verify with `hermes plugins doctor familiar-platform` and `hermes gateway status` (the platform appears

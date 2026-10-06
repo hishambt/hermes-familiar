@@ -739,21 +739,48 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 	async def _api_list_sessions(
 			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
-		"""GET /api/sessions - this machine's own sessions, most recently active first."""
+		"""GET /api/sessions - this machine's own sessions, most recently active first.
+
+		``search`` is the store's own free-text filter: it matches a session's title or its id ANYWHERE IN ITS
+		COMPRESSION CHAIN (so a conversation is found under a name it no longer carries, and ``an94`` finds
+		``AN-94``), and it is applied in SQL BEFORE the window - which is the whole reason page two of a search is
+		page two of the MATCHES rather than page two of everything. That is also why it is asked for here rather
+		than filtered by the caller: a client that filters a page it was given is answering about that page only.
+
+		``total`` is how many rows the filters admit, and it is exact whenever this machine can know it: a listing
+		with no search is counted with the store's own count (built from the same WHERE its rows are), and a
+		search that comes back SHORT of the window is exhausted, so its own length is the answer. A search that
+		FILLS the window cannot be counted anywhere in Hermes - the store counts without a search term and nothing
+		above it counts with one - so ``total`` is ``None`` there, and a client must show what it has rather than
+		invent a number.
+		"""
 		limit = self._bounded(query, "limit", 50, 200)
 		offset = self._bounded(query, "offset", 0, 1_000_000)
 		source = (query.get("source") or [""])[0] or None
+		search = (query.get("search") or [""])[0].strip() or None
 		include_children = (query.get("include_children") or [""])[0].lower() in ("1", "true", "yes")
-		sessions = await self._with_session_db(
-			lambda db: db.list_sessions_rich(
+
+		def read(db: Any) -> Dict[str, Any]:
+			sessions = db.list_sessions_rich(
 				source=source, limit=limit, offset=offset, include_children=include_children,
-				order_by_last_active=True, include_pinned=True))
-		# Pins are back-filled PAST the limit, so only the recency window decides whether another page exists.
-		windowed = sum(1 for session in sessions if not session.get("pinned"))
+				order_by_last_active=True, include_pinned=True, search_query=search)
+			# Pins are back-filled PAST the limit, so only the recency window decides whether another page exists.
+			windowed = sum(1 for session in sessions if not session.get("pinned"))
+			has_more = windowed >= limit
+
+			if search:
+				# No count for a search: short of the window means there is nothing after it.
+				total = None if has_more else offset + len([s for s in sessions if not s.get("pinned")])
+			else:
+				total = db.session_count(source=source, exclude_children=not include_children)
+
+			return {"sessions": sessions, "has_more": has_more, "total": total}
+
+		page = await self._with_session_db(read)
 
 		return {"status": 200, "body": {
-			"object": "list", "data": [_session_payload(session) for session in sessions],
-			"limit": limit, "offset": offset, "has_more": windowed >= limit}}
+			"object": "list", "data": [_session_payload(session) for session in page["sessions"]],
+			"limit": limit, "offset": offset, "has_more": page["has_more"], "total": page["total"]}}
 
 	async def _api_get_session(
 			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:

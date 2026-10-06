@@ -430,6 +430,55 @@ check("with its own title", (row or {}).get("title") == "Read me", str(row))
 check("and its flags as booleans, not as SQLite's 0/1", isinstance((row or {}).get("pinned"), bool), str(row))
 check("and no page beyond this one", body.get("has_more") is False, str(body.get("has_more")))
 
+# A search is the store's own filter, and it is applied BEFORE the window: page two of a search is page two of the
+# MATCHES, which is the whole reason the filtering is asked for here instead of being left to the client.
+found = result_of({
+    "id": "read-search", "action": "api", "method": "GET", "path": "/api/sessions?search=else&limit=5"})
+found_body = found.get("body") or {}
+check(
+    "a search narrows the list to what matches, by title",
+    [item.get("id") for item in found_body.get("data") or []] == [OTHER_ID],
+    str(found_body.get("data"))[:200],
+)
+check(
+    "and a search that comes back short of the window is EXHAUSTED, so it can say how many there are",
+    found_body.get("total") == 1 and found_body.get("has_more") is False,
+    f"total={found_body.get('total')} has_more={found_body.get('has_more')}",
+)
+
+# The store's search matches an ID as well as a title, which is how a conversation is found by a handle from a log
+# line or a link. Both fixtures' ids contain "readers", so this also pins that the match really is on ids.
+by_id = result_of({
+    "id": "read-by-id", "action": "api", "method": "GET", "path": "/api/sessions?search=readers01&limit=5"})
+check(
+    "and by id, not only by title",
+    [item.get("id") for item in ((by_id.get("body") or {}).get("data") or [])] == [READ_ID],
+    str((by_id.get("body") or {}).get("data"))[:200],
+)
+
+# "read" matches BOTH fixtures - one by title, both by id - so the page still has to be a page.
+both = result_of({"id": "read-both", "action": "api", "method": "GET", "path": "/api/sessions?search=read&limit=5"})
+check(
+    "a search that matches several still pages over them",
+    len((both.get("body") or {}).get("data") or []) == 2 and (both.get("body") or {}).get("total") == 2,
+    str(both.get("body"))[:200],
+)
+
+browse = result_of({"id": "read-count", "action": "api", "method": "GET", "path": "/api/sessions?limit=5"})
+check(
+    "a listing with no search is counted with the store's own count, so a numbered pager has a real total",
+    (browse.get("body") or {}).get("total") == 2,
+    str((browse.get("body") or {}).get("total")),
+)
+
+crowded = result_of({"id": "read-crowded", "action": "api", "method": "GET", "path": "/api/sessions?search=e&limit=1"})
+crowded_body = crowded.get("body") or {}
+check(
+    "a search that FILLS the window says nothing about a total rather than inventing one",
+    crowded_body.get("total") is None and crowded_body.get("has_more") is True,
+    f"total={crowded_body.get('total')} has_more={crowded_body.get('has_more')}",
+)
+
 one = result_of({"id": "read-2", "action": "api", "method": "GET", "path": f"/api/sessions/{READ_ID}"})
 session = (one.get("body") or {}).get("session") or {}
 check(
