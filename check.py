@@ -773,14 +773,14 @@ check("an ask says it too, so a quiet instance is still identifiable", clarify["
 
 asyncio.run(
     live.send_exec_approval(
-        "default", "rm -rf /tmp/probe", session_key=SESSION_KEY, description="Deletes a directory", request_id="appr_1"
+        "default", "systemctl restart nginx", session_key=SESSION_KEY, description="Restarts the web server", request_id="appr_1"
     )
 )
 approval = RECEIVED[-1]
 check("an approval is its own kind", approval["json"]["kind"] == "approval", str(approval["json"].get("kind")))
 check(
     "what would run and why it is asked are not the same thing",
-    approval["json"]["command"] == "rm -rf /tmp/probe" and approval["json"]["description"] == "Deletes a directory",
+    approval["json"]["command"] == "systemctl restart nginx" and approval["json"]["description"] == "Restarts the web server",
     str(approval["json"]),
 )
 
