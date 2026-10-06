@@ -64,6 +64,12 @@ CHANNEL_STREAM_PATH = "/api/channel/stream"
 CHANNEL_REPLY_PATH = "/api/channel/reply"
 CHANNEL_PAIR_PATH = "/api/channel/pair"
 CHANNEL_PAIR_WAIT_PATH = "/api/channel/pair/wait"
+# How long the pair endpoint waits for a code to arrive before answering without one. The code takes a round trip
+# to the reader's Familiar, so an endpoint that answered instantly would say "no code" to a person who has no way
+# of knowing that the answer wanted asking for again. Bounded, because a Familiar nobody can reach must not turn
+# a read of the machine into a wait for it.
+PAIR_PROBE_WAIT_S = 10.0
+PAIR_PROBE_TICK_S = 0.1
 
 #: What a paired machine answers out of its OWN state. These are the paths the app already reads over an
 #: instance's HTTP API, answered from Hermes' own store and in the same shape - because the app parses one
@@ -510,6 +516,8 @@ class FamiliarAdapter(BasePlatformAdapter):
 		# The connection this machine holds to Familiar, and the code it is showing while it waits to be paired.
 		self._channel_task: Optional[Any] = None
 		self._pair_code: str = ""
+		# The pairing attempt in flight, if any. One, not one per caller: every attempt mints its own code.
+		self._pairing_task: "asyncio.Task[None] | None" = None
 		# The lifted HomeChannel is the canonical store; extra and the env are the fallbacks.
 		self._home: str = (
 			str(getattr(config.home_channel, "chat_id", "") or "")
@@ -626,7 +634,8 @@ class FamiliarAdapter(BasePlatformAdapter):
 				token = self._presented_token()
 
 				if not token:
-					await self._pair()
+					self._pair_start()
+					await self._pair_hold()
 					delay = RECONNECT_MIN_S
 
 					continue
@@ -1275,6 +1284,41 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 		return {"status": 200, "body": {"job": job}} if job else self._no_such_job()
 
+	def _pair_start(self) -> None:
+		"""Start a pairing attempt, unless one is already in flight.
+
+		ONE, not one per caller. Every attempt mints its own code, so two attempts would leave this machine showing
+		one code while the log and Familiar talked about the other, and the one a reader typed could be the one the
+		wait behind it had already given up on.
+		"""
+		if self._pairing_task is None or self._pairing_task.done():
+			self._pairing_task = asyncio.create_task(self._pair())
+			self._pairing_task.add_done_callback(self._pair_attempt_finished)
+
+	async def _pair_hold(self) -> None:
+		"""Wait on the attempt in flight, whoever started it. Returns the moment it is done.
+
+		Not shielded: this is called from the channel loop, whose own cancellation - a gateway restart, a plugin
+		unload - is the signal to stop asking, and the attempt belongs to that loop's lifetime.
+		"""
+		if self._pairing_task is not None:
+			await self._pairing_task
+
+	def _pair_attempt_finished(self, task: Any) -> None:
+		"""Read an attempt's outcome where it happened, so a failure is reported rather than logged later.
+
+		A task whose exception nobody reads is reported as an unretrieved exception at collection time, which names
+		neither the reason nor the machine - and the code an attempt produces is only ever read by a person looking
+		at the log.
+		"""
+		if task.cancelled():
+			return
+
+		error = task.exception()
+
+		if error is not None:
+			logger.warning("[familiar] pairing could not be started: %s", error)
+
 	async def _pair(self) -> None:
 		"""Ask Familiar for a code, show it, and wait for it to be claimed.
 
@@ -1376,8 +1420,25 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 		On loopback only, like the rest of the ingress: whoever can reach this is whoever is sitting at the machine,
 		which is exactly who the code is for.
+
+		Asked while this machine has neither a token nor a code, it starts asking and waits for the code to arrive
+		instead of answering "no code" and leaving the reader to work out that the command wants running again -
+		which is not something the reader can know. The wait is bounded, so a Familiar nobody can reach answers
+		without a code, which is then the truth rather than a stall.
 		"""
 		from aiohttp import web
+
+		if not self._presented_token():
+			self._pair_start()
+
+			loop = asyncio.get_running_loop()
+			deadline = loop.time() + PAIR_PROBE_WAIT_S
+
+			while not self._pair_code:
+				if loop.time() >= deadline or (self._pairing_task is not None and self._pairing_task.done()):
+					break
+
+				await asyncio.sleep(PAIR_PROBE_TICK_S)
 
 		return web.json_response({
 			"paired": bool(self._presented_token()),

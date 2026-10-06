@@ -112,7 +112,8 @@ The token is the one thing not set by hand: it is issued when the machine **pair
 plugin, point it at where Familiar is with `FAMILIAR_URL`, restart the gateway - and the machine shows a code.
 Two places have it, and both are on that machine: the log, at the moment it is minted, and
 `http://127.0.0.1:8644/familiar/pair`, which answers with the code while this machine is unpaired and
-`paired: true` once it is not. Claiming that code in Familiar creates the instance and hands the machine its
+`paired: true` once it is not. If the code has not arrived yet it is asked for and waited on, so one command is
+enough: nothing here needs running twice to get an answer. Claiming that code in Familiar creates the instance and hands the machine its
 token, which it keeps beside the plugin so a restart does not lose it. Setting `FAMILIAR_TOKEN` by hand instead
 works, but a pairing replaces it.
 

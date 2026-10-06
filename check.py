@@ -208,6 +208,13 @@ with without_env("FAMILIAR_TOKEN"):
         started = await unpaired_machine.connect()
         bound = unpaired_machine._ingress_runner is not None
         code = await unpaired_machine._handle_pair_probe(None)
+
+        # Asked with a code already in hand, the same endpoint hands back THAT code and starts nothing: it is what a
+        # person sitting at the machine runs, so the answer has to be the code they can type - not a second one, and
+        # not "no code" from an endpoint that had one all along.
+        unpaired_machine._pair_code = "PROBE1"
+        held = json.loads((await unpaired_machine._handle_pair_probe(None)).text)
+
         refused = await unpaired_machine._handle_ingress(_Unpaired())
 
         # What pairing supplies, and the fact that the listener takes it in the same breath: seeded from the config
@@ -221,15 +228,18 @@ with without_env("FAMILIAR_TOKEN"):
 
         await unpaired_machine.disconnect()
 
-        return started, bound, code, refused, adopted
+        return started, bound, code, held, refused, adopted
 
-    _started, _bound, _code, _refused, _adopted = asyncio.run(_unpaired_run())
+    _started, _bound, _code, _held, _refused, _adopted = asyncio.run(_unpaired_run())
     check("connect() starts without a token, because the channel dials out", _started is True)
     # The code this machine shows is read from the pair endpoint ON the machine, and whoever reads it is sitting at
     # the machine that has not paired yet - the reader the guide sends there. A listener that waited for a token left
     # exactly that reader with nothing to read.
     check("and brings its ingress up with it, so the code can be read on the machine", _bound is True)
     check("the pair endpoint answers there, before any token exists", getattr(_code, "status", None) == 200, str(_code))
+    # What it answers is the code in hand, and answering costs nothing: a reader who runs the command ONCE gets the
+    # code, rather than a "not yet" they would have no way of knowing to ask again for.
+    check("and gives back the code it already had", _held.get("code") == "PROBE1", str(_held))
     # What is NOT open is a MESSAGE: the route authenticates with the token this machine pairs with, and there is
     # none yet, so a caller that can reach loopback is refused rather than turned into a turn.
     check(
