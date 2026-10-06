@@ -1178,17 +1178,17 @@ class FamiliarAdapter(BasePlatformAdapter):
 			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
 		"""GET /api/jobs - what this machine has scheduled, a page at a time.
 
-		Paged and sorted HERE, for the same reason the sessions list is: the app asks for what its table shows, so a
-		machine with a hundred jobs answers with a page rather than all of them. A sort the reader clicked travels as
-		the field and direction the table's column names, and what a job does not have sorts as an empty string, which
-		is where PrimeNG put it when this list was sorted in the browser.
+		Paged HERE, for the same reason the sessions list is: the app asks for what its table shows, so a machine with
+		a hundred jobs answers with a page rather than all of them.
+
+		NOT sorted, and the order is the instance's own. A table that holds one page cannot sort the list - it would
+		sort the page and call it the answer - so the app offers no sort control here and nothing is asked for one,
+		the same way the sessions and topics lists work. This machine decides the order it runs things in.
 		"""
 		include_disabled = (query.get("include_disabled") or [""])[0].lower() in ("true", "1")
 		limit = self._bounded(query, "limit", 50, 200)
 		offset = self._bounded(query, "offset", 0, 1_000_000)
 		search = (query.get("search") or [""])[0].strip().lower()
-		sort = (query.get("sort") or [""])[0].strip()
-		order = (query.get("order") or ["asc"])[0].strip().lower()
 
 		jobs = await asyncio.to_thread(
 			lambda: self._cron()["list"](include_disabled=include_disabled) or [])
@@ -1198,9 +1198,6 @@ class FamiliarAdapter(BasePlatformAdapter):
 				job for job in jobs
 				if search in str(job.get("name") or "").lower() or search in str(job.get("prompt") or "").lower()
 			]
-
-		if sort:
-			jobs = sorted(jobs, key=lambda job: str(job.get(sort) or ""), reverse=order == "desc")
 
 		page = jobs[offset:offset + limit]
 

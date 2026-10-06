@@ -360,11 +360,12 @@ _rest = _jobs("limit=2&offset=2")
 check("the second page is the rest of it", [job["name"] for job in _rest["data"]] == ["Bravo"], str(_rest["data"]))
 check("and the last page knows it is the last", _rest["has_more"] is False, str(_rest["has_more"]))
 
-_sorted = _jobs("sort=name&order=desc")
+# A sort asked for changes nothing: a table holding one page cannot sort the list, so the order stays the machine's.
+_asked_to_sort = _jobs("sort=name&order=desc")
 check(
-	"a sort the reader clicked comes back in that order",
-	[job["name"] for job in _sorted["data"]] == ["Charlie", "Bravo", "Alpha"],
-	str([job["name"] for job in _sorted["data"]]),
+	"asking for a sort does not reorder the machine's own",
+	[job["name"] for job in _asked_to_sort["data"]] == ["Charlie", "Alpha", "Bravo"],
+	str([job["name"] for job in _asked_to_sort["data"]]),
 )
 
 _searched = _jobs("search=brav")
