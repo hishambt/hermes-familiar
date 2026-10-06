@@ -73,11 +73,12 @@ one that takes arguments:
 - `search` - free text, matched against a session's **title or id anywhere in its compression chain**. It is
   applied in SQL **before** the page, so page two of a search is page two of the matches. This is the reason to
   send it here rather than filter a page in the client, which can only ever answer about the page it holds.
-- `total` comes back with the rows: how many the filters admit. It is exact for a listing with no search (the
-  store's own count, over the same WHERE) and for a search that returns **short of** the window (an exhausted
-  search is its own count). A search that **fills** the window cannot be counted - the store counts without a
-  search term and nothing above it counts with one - so `total` is `null` there. Show what you have; do not
-  invent a number.
+- `total` comes back with the rows: how many the filters admit. It is exact, and how the machine gets it depends
+  on the question. A listing with no search uses the store's own count, over the same WHERE its rows came
+  through. A search is counted by **reading the matches** - nothing above the store counts a search, and the
+  matches are what its own filter admits, so their length is the answer - up to 5000 of them. Only **past** that
+  ceiling is `total` `null`: count more than that and the machine is reading rows nobody asked for, and a number
+  nobody read is worse than none. Show what you have; do not invent a number.
 
 ## Setup
 

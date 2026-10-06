@@ -474,9 +474,27 @@ check(
 crowded = result_of({"id": "read-crowded", "action": "api", "method": "GET", "path": "/api/sessions?search=e&limit=1"})
 crowded_body = crowded.get("body") or {}
 check(
-    "a search that FILLS the window says nothing about a total rather than inventing one",
-    crowded_body.get("total") is None and crowded_body.get("has_more") is True,
+    "a search that FILLS the window is counted anyway, by reading the matches its own filter admits",
+    crowded_body.get("total") == 2 and crowded_body.get("has_more") is True,
     f"total={crowded_body.get('total')} has_more={crowded_body.get('has_more')}",
+)
+
+# The ceiling is the one place this machine answers "not counted": past it, counting a search means reading more
+# rows than a page is worth, and a number nobody read is worse than no number. Lowered here rather than seeded,
+# because what is being pinned is the ANSWER past the ceiling, not the reading of five thousand rows.
+_ceiling = adapter._SEARCH_COUNT_CEILING
+adapter._SEARCH_COUNT_CEILING = 1
+try:
+    capped = result_of({
+        "id": "read-capped", "action": "api", "method": "GET", "path": "/api/sessions?search=e&limit=1"})
+finally:
+    adapter._SEARCH_COUNT_CEILING = _ceiling
+
+capped_body = capped.get("body") or {}
+check(
+    "and past the ceiling it says it did not count rather than guessing",
+    capped_body.get("total") is None and capped_body.get("has_more") is True,
+    f"total={capped_body.get('total')} has_more={capped_body.get('has_more')}",
 )
 
 one = result_of({"id": "read-2", "action": "api", "method": "GET", "path": f"/api/sessions/{READ_ID}"})

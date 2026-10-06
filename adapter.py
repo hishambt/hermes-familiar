@@ -83,6 +83,13 @@ _API_ROUTES = (
 	("POST", r"/api/jobs/(?P<job>[^/]+)/(?P<action>run|pause|resume)", "_api_job_action"),
 )
 
+#: How many matches of a search this machine will READ to count them. Counting a search is reading it: Hermes'
+#: store counts a listing without a search term, nothing over it counts with one, and the search itself runs in
+#: SQL over whole compression chains - so the only thing that can answer "how many" is the store, one row at a
+#: time. Past this ceiling it answers ``None``: the machine would rather say it did not count than report a number
+#: it never read. A search narrow enough to fill a page is counted long before getting here.
+_SEARCH_COUNT_CEILING = 5000
+
 #: The cron store's own limits, copied from the API server so a job made down the connection is held to exactly
 #: what one made over HTTP is held to: one rule, whichever door it came through.
 _JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
@@ -747,12 +754,12 @@ class FamiliarAdapter(BasePlatformAdapter):
 		page two of the MATCHES rather than page two of everything. That is also why it is asked for here rather
 		than filtered by the caller: a client that filters a page it was given is answering about that page only.
 
-		``total`` is how many rows the filters admit, and it is exact whenever this machine can know it: a listing
-		with no search is counted with the store's own count (built from the same WHERE its rows are), and a
-		search that comes back SHORT of the window is exhausted, so its own length is the answer. A search that
-		FILLS the window cannot be counted anywhere in Hermes - the store counts without a search term and nothing
-		above it counts with one - so ``total`` is ``None`` there, and a client must show what it has rather than
-		invent a number.
+		``total`` is how many rows the filters admit, and it is exact whenever this machine can know it. A listing
+		with no search is counted with the store's own count, built from the same WHERE its rows are. A search
+		cannot be counted that way - the store counts without a search term and nothing above it counts with one -
+		so this machine counts it the only way a search can be counted: by READING the matches its own filter
+		admits, whose length IS the answer, up to ``_SEARCH_COUNT_CEILING``. Past that ceiling - and only past it -
+		``total`` is ``None``, and a client must show what it has rather than invent a number.
 		"""
 		limit = self._bounded(query, "limit", 50, 200)
 		offset = self._bounded(query, "offset", 0, 1_000_000)
@@ -768,9 +775,17 @@ class FamiliarAdapter(BasePlatformAdapter):
 			windowed = sum(1 for session in sessions if not session.get("pinned"))
 			has_more = windowed >= limit
 
-			if search:
-				# No count for a search: short of the window means there is nothing after it.
-				total = None if has_more else offset + len([s for s in sessions if not s.get("pinned")])
+			if search and has_more:
+				# A search that FILLS the window is the one case with no count anywhere above this machine, so the
+				# matches are read: the same filter the rows just came through, asked for compact and pinned
+				# included, so what comes back IS the match set and its length is the total rather than a guess.
+				matches = db.list_sessions_rich(
+					source=source, limit=_SEARCH_COUNT_CEILING + 1, offset=0, include_children=include_children,
+					order_by_last_active=True, include_pinned=True, compact_rows=True, search_query=search)
+				total = len(matches) if len(matches) <= _SEARCH_COUNT_CEILING else None
+			elif search:
+				# Short of the window means there is nothing after it: its own length is the answer.
+				total = offset + windowed
 			else:
 				total = db.session_count(source=source, exclude_children=not include_children)
 
