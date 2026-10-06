@@ -154,6 +154,25 @@ with without_env("FAMILIAR_TOKEN"):
 check("a URL alone seeds, with no token on it", unpair is not None and "token" not in unpair, str(unpair))
 
 live = adapter.FamiliarAdapter(config(url=URL, token="tok_abc123"))
+
+# A message from Familiar arriving down the connection: how a machine with no address is spoken to. It is handed to
+# the door that already exists rather than a second implementation of it, so the first thing to assert is that a
+# frame with nothing in it is refused instead of started.
+check(
+    "a say carrying no message is refused rather than run",
+    asyncio.run(live._channel_say({"message": {}})) == {"error": "no message"},
+)
+
+# And that a real one goes to this machine's own ingress, which is stubbed here: the point is that it arrives
+# somewhere rather than being silently dropped, because Familiar is waiting on this answer.
+_stub_port = int(URL.rsplit(":", 1)[1])
+_held_port = live._ingress_port
+try:
+    live._ingress_port = _stub_port
+    _said = asyncio.run(live._channel_say({"message": {"text": "hello", "chatId": "default"}}))
+finally:
+    live._ingress_port = _held_port
+check("a say carrying a message reaches this machine's own ingress", isinstance(_said, dict), str(_said))
 check("connect() reports ready", asyncio.run(live.connect()) is True)
 check("home target defaults to 'default'", live._home == "default")
 with without_env("FAMILIAR_TOKEN"):

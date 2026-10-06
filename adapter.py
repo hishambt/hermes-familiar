@@ -522,10 +522,14 @@ class FamiliarAdapter(BasePlatformAdapter):
 		"""
 		request_id = str(frame.get("id") or "")
 		channel = str(frame.get("channel") or self._home)
+		action = str(frame.get("action") or "")
 
 		try:
-			known = await self._apply_action(frame, channel)
-			result: Dict[str, Any] = {"ok": True} if known else {"error": f"unknown action: {frame.get('action')}"}
+			if action == "say":
+				result = await self._channel_say(frame)
+			else:
+				known = await self._apply_action(frame, channel)
+				result = {"ok": True} if known else {"error": f"unknown action: {action}"}
 		except Exception as error:  # noqa: BLE001 - an answer is owed either way
 			logger.warning("[%s] a channel request failed: %s", self.name, error)
 			result = {"error": str(error)}
@@ -535,6 +539,41 @@ class FamiliarAdapter(BasePlatformAdapter):
 				_post, self._url, token, {"id": request_id, "result": result}, CHANNEL_REPLY_PATH)
 		except _DeliveryError as error:
 			logger.warning("[%s] could not answer a channel request: %s", self.name, error)
+
+	async def _channel_say(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+		"""Take a message Familiar sent, into this machine's own ingress.
+
+		A message arriving this way IS the same thing the ingress carries, and it is handed to the same door rather
+		than to a second implementation of it: the plugin posts to its own loopback ingress with its own token. So
+		there is one idea of what a message from Familiar does, and the path that already works is the path used.
+
+		The connection is the credential for reaching Familiar; inside the machine it is still the instance's own
+		token, which this plugin holds.
+		"""
+		import aiohttp
+
+		message = frame.get("message")
+
+		if not isinstance(message, dict) or not str(message.get("text") or "").strip():
+			return {"error": "no message"}
+
+		timeout = aiohttp.ClientTimeout(total=30)
+
+		async with aiohttp.ClientSession(timeout=timeout) as session:
+			async with session.post(
+				f"http://127.0.0.1:{self._ingress_port}{INGRESS_PATH}",
+				headers={"Authorization": f"Bearer {self._ingress_token}"},
+				json=message,
+			) as response:
+				try:
+					body = await response.json()
+				except Exception:  # noqa: BLE001 - an answer that is not JSON is still an answer
+					body = {}
+
+				if response.status >= 400:
+					return {"error": f"the ingress answered HTTP {response.status}"}
+
+				return {"sessionId": body.get("sessionId")}
 
 	async def _pair(self) -> None:
 		"""Ask Familiar for a code, show it, and wait for it to be claimed.
