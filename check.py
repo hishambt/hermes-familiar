@@ -177,12 +177,55 @@ check("connect() reports ready", asyncio.run(live.connect()) is True)
 check("home target defaults to 'default'", live._home == "default")
 with without_env("FAMILIAR_TOKEN"):
     # The channel is the direction that needs NOTHING on this machine: it dials out. So an unpaired machine still
-    # connects - that is how it pairs - and only the ingress waits for a token to authenticate with.
+    # connects - that is how it pairs.
     unpaired_machine = adapter.FamiliarAdapter(config(url=URL))
-    check("connect() starts without a token, because the channel dials out", asyncio.run(unpaired_machine.connect()) is True)
-    check("and leaves the ingress alone until it has one", unpaired_machine._ingress_runner is None)
-    unpaired_machine._channel_task.cancel()
-    asyncio.run(unpaired_machine.disconnect())
+
+    # One loop for the whole thing: the ingress binds a socket, and a socket belongs to the loop that opened it, so
+    # connecting on one loop and disconnecting on another tears down a proactor that is already gone.
+    class _Unpaired:
+        headers = {"Authorization": "Bearer "}
+
+        async def json(self):
+            return {"text": "hello", "channel": "default"}
+
+    async def _unpaired_run():
+        started = await unpaired_machine.connect()
+        bound = unpaired_machine._ingress_runner is not None
+        code = await unpaired_machine._handle_pair_probe(None)
+        refused = await unpaired_machine._handle_ingress(_Unpaired())
+
+        # What pairing supplies, and the fact that the listener takes it in the same breath: seeded from the config
+        # the credential is EMPTY on this machine, so a listener that came up before pairing would otherwise keep
+        # refusing its own calls until a restart.
+        unpaired_machine._take_token("a-token-from-pairing")
+        adopted = unpaired_machine._ingress_token
+
+        if unpaired_machine._channel_task:
+            unpaired_machine._channel_task.cancel()
+
+        await unpaired_machine.disconnect()
+
+        return started, bound, code, refused, adopted
+
+    _started, _bound, _code, _refused, _adopted = asyncio.run(_unpaired_run())
+    check("connect() starts without a token, because the channel dials out", _started is True)
+    # The code this machine shows is read from the pair endpoint ON the machine, and whoever reads it is sitting at
+    # the machine that has not paired yet - the reader the guide sends there. A listener that waited for a token left
+    # exactly that reader with nothing to read.
+    check("and brings its ingress up with it, so the code can be read on the machine", _bound is True)
+    check("the pair endpoint answers there, before any token exists", getattr(_code, "status", None) == 200, str(_code))
+    # What is NOT open is a MESSAGE: the route authenticates with the token this machine pairs with, and there is
+    # none yet, so a caller that can reach loopback is refused rather than turned into a turn.
+    check(
+        "while a message through it is refused until this machine is paired",
+        getattr(_refused, "status", None) == 401,
+        str(_refused),
+    )
+    check(
+        "a token learned by pairing becomes the ingress credential",
+        _adopted == "a-token-from-pairing",
+        _adopted,
+    )
 
 # 3. A delivery, and what the receiver sees.
 print("\ndelivery")

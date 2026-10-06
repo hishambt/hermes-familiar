@@ -107,10 +107,18 @@ machine reports itself back. What follows is for a machine Familiar has no shell
 by hand.
 
 The token is the one thing not set by hand: it is issued when the machine **pairs**. Install and enable the
-plugin, point it at where Familiar is with `FAMILIAR_URL`, restart the gateway - and the machine shows a code
-(its log, and `http://127.0.0.1:8644/familiar/pair` on the machine itself). Claiming that code in Familiar
-creates the instance and hands the machine its token, which it keeps beside the plugin so a restart does not
-lose it. Setting `FAMILIAR_TOKEN` by hand instead works, but a pairing replaces it.
+plugin, point it at where Familiar is with `FAMILIAR_URL`, restart the gateway - and the machine shows a code.
+Two places have it, and both are on that machine: the log, at the moment it is minted, and
+`http://127.0.0.1:8644/familiar/pair`, which answers with the code while this machine is unpaired and
+`paired: true` once it is not. Claiming that code in Familiar creates the instance and hands the machine its
+token, which it keeps beside the plugin so a restart does not lose it. Setting `FAMILIAR_TOKEN` by hand instead
+works, but a pairing replaces it.
+
+**If nothing answers on 8644**, the plugin did not load or something else on that machine holds the port. The
+gateway log says which (`ingress could not bind 127.0.0.1:8644`), and a machine that pairs and delivers while
+its ingress is down still cannot take a message through it. Move it with `FAMILIAR_INGRESS_PORT` (and
+`FAMILIAR_INGRESS_HOST`) if the port is taken - both are settings like any other, and the address to read the
+code from moves with them.
 
 Four cards in Familiar's Console, in this order:
 

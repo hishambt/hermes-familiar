@@ -479,6 +479,20 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 	# -- Connection lifecycle -----------------------------------------------
 
+	def _take_token(self, token: str) -> None:
+		"""The token this machine was paired with, in both directions it is used.
+
+		One credential, presented two ways: the machine proves itself with it when it holds the connection, and its
+		own ingress route asks for it when something arrives here. The ingress copy is seeded from the config at
+		load, which is EMPTY on a machine that has not paired yet - so a listener that comes up before pairing has to
+		be given the token when pairing supplies one, or it keeps refusing its own calls until a restart. An
+		explicitly configured ingress token is left alone: that is somebody's deliberate setting.
+		"""
+		self._token = token
+
+		if not self._ingress_token:
+			self._ingress_token = token
+
 	async def connect(self, *, is_reconnect: bool = False) -> bool:
 		"""Open the ingress: the one route Familiar posts a person's message to.
 
@@ -497,12 +511,15 @@ class FamiliarAdapter(BasePlatformAdapter):
 			logger.warning("[familiar] no FAMILIAR_URL configured, so there is nothing to connect to")
 
 		if not self._token:
-			logger.info("[familiar] not paired yet: the channel asks for a code, and the ingress waits for one")
-
-			if started:
-				self._mark_connected()
-
-			return started
+			# The listener comes up BEFORE pairing, which is the point of it: the code this machine shows is read
+			# from `GET /familiar/pair`, and whoever reads it is by definition sitting at the machine that has not
+			# paired yet. Binding only once a token existed left that reader with nothing to read, while the guide
+			# and the app both pointed at it.
+			#
+			# What this does NOT open: a message. The route authenticates with the token this machine pairs with,
+			# and there is none yet, so every call is refused (401) rather than accepted from anyone who reaches
+			# loopback. The two GETs are loopback-only by design, which is exactly who the code is for.
+			logger.info("[familiar] not paired yet: the channel asks for a code, and its ingress serves it")
 
 		from aiohttp import web
 
@@ -557,7 +574,7 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 					continue
 
-				self._token = token
+				self._take_token(token)
 				await self._hold_channel(token)
 				delay = RECONNECT_MIN_S
 			except asyncio.CancelledError:
@@ -1237,7 +1254,7 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 						if token:
 							_save_token(token)
-							self._token = token
+							self._take_token(token)
 							self._pair_code = ""
 							logger.info("[familiar] paired: this machine is reachable through the channel now")
 
@@ -1315,7 +1332,9 @@ class FamiliarAdapter(BasePlatformAdapter):
 		# The same token Familiar issues for deliveries, presented the other way round. Neither direction
 		# authenticates the other: the instance is the one proving who it is here.
 		presented = request.headers.get("Authorization", "")
-		if not self._ingress_token or presented != f"Bearer {self._ingress_token}":
+		expected = self._ingress_token or self._token
+
+		if not expected or presented != f"Bearer {expected}":
 			logger.warning("[familiar] refused an ingress call: bad or missing token")
 			return web.json_response({"error": "unauthorized"}, status=401)
 
