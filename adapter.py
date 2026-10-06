@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import socket
 import time
+import uuid
 import asyncio
 import contextlib
 import json
@@ -66,12 +67,31 @@ CHANNEL_PAIR_WAIT_PATH = "/api/channel/pair/wait"
 #: What a paired machine answers out of its OWN state. These are the paths the app already reads over an
 #: instance's HTTP API, answered from Hermes' own store and in the same shape - because the app parses one
 #: shape, and a second one would be a second source of truth. A path that is not here is refused by name.
+#: What a paired machine answers out of its OWN state. These are the paths the app already reads over an
+#: instance's HTTP API, answered from Hermes' own store and in the same shape - because the app parses one
+#: shape, and a second one would be a second source of truth. A path that is not here is refused by name.
 _API_ROUTES = (
 	("GET", r"/api/sessions", "_api_list_sessions"),
-	("GET", r"/api/sessions/(?P<session>[^/]+)", "_api_get_session"),
 	("GET", r"/api/sessions/(?P<session>[^/]+)/messages", "_api_session_messages"),
+	("POST", r"/api/sessions/(?P<session>[^/]+)/fork", "_api_fork_session"),
+	("GET", r"/api/sessions/(?P<session>[^/]+)", "_api_get_session"),
 	("PATCH", r"/api/sessions/(?P<session>[^/]+)", "_api_patch_session"),
+	("DELETE", r"/api/sessions/(?P<session>[^/]+)", "_api_delete_session"),
+	("GET", r"/api/model/options", "_api_model_options"),
+	("GET", r"/api/jobs", "_api_list_jobs"),
+	("POST", r"/api/jobs", "_api_create_job"),
+	("GET", r"/api/jobs/(?P<job>[^/]+)", "_api_get_job"),
+	("PATCH", r"/api/jobs/(?P<job>[^/]+)", "_api_update_job"),
+	("DELETE", r"/api/jobs/(?P<job>[^/]+)", "_api_delete_job"),
+	("POST", r"/api/jobs/(?P<job>[^/]+)/(?P<action>run|pause|resume)", "_api_job_action"),
 )
+
+#: The cron store's own limits, copied from the API server so a job made down the connection is held to exactly
+#: what one made over HTTP is held to: one rule, whichever door it came through.
+_JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
+_JOB_UPDATE_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+_MAX_JOB_NAME = 200
+_MAX_JOB_PROMPT = 5000
 
 #: Where a paired machine keeps the token it was given. Beside the plugin, because it belongs to the INSTALL and
 #: not to a Hermes config: nothing a reader edits by hand should hold a credential that arrives by pairing.
@@ -840,6 +860,292 @@ class FamiliarAdapter(BasePlatformAdapter):
 			return self._no_such_session(session_id)
 
 		return {"status": 200, "body": {"object": "hermes.session", "session": _session_payload(session)}}
+
+	def _cron(self) -> Dict[str, Any]:
+		"""This machine's own cron store, imported where the API server imports it.
+
+		The plugin is inside Hermes, so the jobs a client creates are the same records the scheduler runs - reached
+		directly rather than through an HTTP surface that has to be switched on and keyed first.
+		"""
+		from cron.jobs import (
+			get_job, list_jobs, pause_job, remove_job, resume_job, trigger_job, update_job)
+		from cron.scheduler import create_job_with_scheduler_registration
+
+		return {"list": list_jobs, "get": get_job, "create": create_job_with_scheduler_registration,
+			"update": update_job, "remove": remove_job, "pause": pause_job, "resume": resume_job,
+			"trigger": trigger_job}
+
+	@staticmethod
+	def _jobs_changed() -> None:
+		"""Tell a co-resident provider the store moved, the way the API's own writes do."""
+		with contextlib.suppress(Exception):
+			from cron.scheduler import _notify_provider_jobs_changed
+
+			_notify_provider_jobs_changed()
+
+	@staticmethod
+	def _no_such_job() -> Dict[str, Any]:
+		return {"status": 404, "body": _api_error("Job not found", "job_not_found")}
+
+	@staticmethod
+	def _job_prompt_error(prompt: str) -> str:
+		"""The API's own prompt guard, so a job made here is held to what one made over HTTP is held to."""
+		if len(prompt) > _MAX_JOB_PROMPT:
+			return f"Prompt must be ≤ {_MAX_JOB_PROMPT} characters"
+
+		try:
+			from tools.cronjob_tools import _scan_cron_prompt
+		except Exception:  # noqa: BLE001 - the scanner is optional hardening, never a reason to refuse
+			return ""
+
+		return _scan_cron_prompt(prompt) or ""
+
+	async def _api_fork_session(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""POST /api/sessions/{id}/fork - branch a conversation, which is how a topic starts from a session.
+
+		The child is created FIRST and the source ended after it, which is the CLI's own order: a create that fails
+		must never leave the source ended with nothing to carry on from.
+		"""
+		source_id = groups["session"]
+		fields = body if isinstance(body, dict) else {}
+
+		def work(db: Any) -> Any:
+			source = db.get_session(source_id)
+
+			if not source:
+				return None
+
+			fork_id = str(fields.get("id") or fields.get("session_id") or "").strip() or (
+				f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}")
+
+			if db.get_session(fork_id):
+				return "exists"
+
+			# `_branched_from` is the durable branch marker: an unmarked child is walked into its parent's
+			# lineage and vanishes from a default listing.
+			db.create_session(fork_id, "familiar", model=source.get("model"),
+				system_prompt=source.get("system_prompt"), parent_session_id=source_id,
+				model_config={"_branched_from": source_id})
+			db.end_session(source_id, "branched")
+			db.replace_messages(fork_id, db.get_messages(source_id))
+			title = fields.get("title")
+			if title is None:
+				base = source.get("title") or "fork"
+				title = f"{base} fork"
+				with contextlib.suppress(Exception):
+					title = db.get_next_title_in_lineage(base)
+			db.set_session_title(fork_id, str(title))
+
+			return db.get_session(fork_id) or {"id": fork_id, "parent_session_id": source_id}
+
+		try:
+			forked = await self._with_session_db(work)
+		except ValueError as error:
+			return {"status": 400, "body": _api_error(str(error), "invalid_title")}
+
+		if forked is None:
+			return self._no_such_session(source_id)
+
+		if forked == "exists":
+			return {"status": 409, "body": _api_error("Session already exists", "session_exists")}
+
+		return {"status": 201, "body": {"object": "hermes.session", "session": _session_payload(forked)}}
+
+	async def _api_delete_session(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""DELETE /api/sessions/{id} - forget a conversation on this machine."""
+		session_id = groups["session"]
+
+		def work(db: Any) -> Any:
+			if not db.get_session(session_id):
+				return None
+
+			return bool(db.delete_session(session_id))
+
+		deleted = await self._with_session_db(work)
+
+		if deleted is None:
+			return self._no_such_session(session_id)
+
+		return {"status": 200, "body": {
+			"object": "hermes.session.deleted", "id": session_id, "deleted": deleted}}
+
+	async def _api_model_options(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /api/model/options - the model picker's inventory, built where Hermes builds it."""
+		refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
+
+		def work() -> Any:
+			from hermes_cli.inventory import build_model_options_payload, load_picker_context
+
+			return build_model_options_payload(
+				load_picker_context(), include_unconfigured=True, refresh=refresh)
+
+		# Enrichment can fetch pricing and provider catalogs, which is the API server's reason for the thread too.
+		return {"status": 200, "body": await asyncio.to_thread(work)}
+
+	async def _api_list_jobs(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /api/jobs - what this machine has scheduled."""
+		include_disabled = (query.get("include_disabled") or [""])[0].lower() in ("true", "1")
+		store = self._cron()
+
+		return {"status": 200, "body": {
+			"jobs": await asyncio.to_thread(lambda: store["list"](include_disabled=include_disabled))}}
+
+	async def _api_get_job(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /api/jobs/{id} - one job, as the store holds it."""
+		job = await asyncio.to_thread(self._cron()["get"], groups["job"])
+
+		return {"status": 200, "body": {"job": job}} if job else self._no_such_job()
+
+	async def _api_create_job(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""POST /api/jobs - schedule something on this machine.
+
+		The job's ORIGIN is this channel, so `deliver: origin` means "wherever Familiar is" rather than an API
+		server that answers nobody - the same intent a reader picks in the app, on the machine's own terms.
+		"""
+		fields = body if isinstance(body, dict) else {}
+		name = str(fields.get("name") or "").strip()
+		schedule = str(fields.get("schedule") or "").strip()
+		prompt = fields.get("prompt") or ""
+
+		if not name:
+			return {"status": 400, "body": _api_error("Name is required", "invalid_job")}
+
+		if len(name) > _MAX_JOB_NAME:
+			return {"status": 400, "body": _api_error(
+				f"Name must be ≤ {_MAX_JOB_NAME} characters", "invalid_job")}
+
+		if not schedule:
+			return {"status": 400, "body": _api_error("Schedule is required", "invalid_job")}
+
+		problem = self._job_prompt_error(str(prompt))
+
+		if problem:
+			return {"status": 400, "body": _api_error(problem, "invalid_job")}
+
+		repeat = fields.get("repeat")
+
+		if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
+			return {"status": 400, "body": _api_error("Repeat must be a positive integer", "invalid_job")}
+
+		kwargs: Dict[str, Any] = {
+			"prompt": prompt, "schedule": schedule, "name": name,
+			"deliver": fields.get("deliver") or "local",
+			# The PLATFORM, not the label: a delivery resolves a platform by this value, and "Familiar" is
+			# what the row is titled.
+			"origin": {"platform": self.platform.value, "chat_id": self._home},
+		}
+
+		for key in ("paused", "paused_reason"):
+			if key in fields:
+				kwargs[key] = fields[key]
+
+		if fields.get("skills"):
+			kwargs["skills"] = fields["skills"]
+
+		if repeat is not None:
+			kwargs["repeat"] = repeat
+
+		try:
+			job = await asyncio.to_thread(lambda: self._cron()["create"](**kwargs))
+		except ValueError as error:
+			return {"status": 400, "body": _api_error(str(error), "invalid_job")}
+		except Exception as error:  # noqa: BLE001 - a store that refuses says why, in its own words
+			# A scheduler that cannot register the job is a 424 on the API server, and the store's own code is
+			# what carries the reason - so it is passed through rather than flattened.
+			status = int(getattr(error, "status", 500) or 500)
+
+			return {"status": status, "body": _api_error(str(error), "job_create_failed")}
+
+		return {"status": 200, "body": {"job": job}}
+
+	async def _api_update_job(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""PATCH /api/jobs/{id} - what a reader changed about a job."""
+		fields = body if isinstance(body, dict) else {}
+		# Whitelisted the way the API server whitelists it: a field nobody may set is not silently stored.
+		sanitized = {key: value for key, value in fields.items() if key in _JOB_UPDATE_FIELDS}
+
+		if not sanitized:
+			return {"status": 400, "body": _api_error("No valid fields to update", "invalid_job")}
+
+		if "name" in sanitized and len(str(sanitized["name"])) > _MAX_JOB_NAME:
+			return {"status": 400, "body": _api_error(
+				f"Name must be ≤ {_MAX_JOB_NAME} characters", "invalid_job")}
+
+		if "prompt" in sanitized:
+			problem = self._job_prompt_error(str(sanitized["prompt"] or ""))
+
+			if problem:
+				return {"status": 400, "body": _api_error(problem, "invalid_job")}
+
+		def work() -> Any:
+			job = self._cron()["update"](groups["job"], sanitized)
+
+			if job:
+				self._jobs_changed()
+
+			return job
+
+		job = await asyncio.to_thread(work)
+
+		return {"status": 200, "body": {"job": job}} if job else self._no_such_job()
+
+	async def _api_delete_job(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""DELETE /api/jobs/{id} - take a job off the schedule."""
+		def work() -> Any:
+			removed = self._cron()["remove"](groups["job"])
+
+			if removed:
+				self._jobs_changed()
+
+			return removed
+
+		return {"status": 200, "body": {"ok": True}} if await asyncio.to_thread(work) else self._no_such_job()
+
+	async def _api_job_action(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""POST /api/jobs/{id}/run|pause|resume - one job, acted on now."""
+		action = groups["action"]
+		job_id = groups["job"]
+
+		if not _JOB_ID_RE.fullmatch(job_id):
+			return {"status": 400, "body": _api_error("Invalid job ID format", "invalid_job_id")}
+
+		fields = body if isinstance(body, dict) else {}
+		extra: Optional[str] = None
+
+		if action == "run" and fields.get("prompt") is not None:
+			extra = str(fields["prompt"])
+			problem = self._job_prompt_error(extra)
+
+			if problem:
+				return {"status": 400, "body": _api_error(problem, "invalid_job")}
+
+			extra = extra or None
+
+		def work() -> Any:
+			store = self._cron()
+
+			if action == "run":
+				job = store["trigger"](job_id, extra_prompt=extra)
+			else:
+				job = (store["pause"] if action == "pause" else store["resume"])(job_id)
+
+			if job and action != "run":
+				self._jobs_changed()
+
+			return job
+
+		job = await asyncio.to_thread(work)
+
+		return {"status": 200, "body": {"job": job}} if job else self._no_such_job()
 
 	async def _pair(self) -> None:
 		"""Ask Familiar for a code, show it, and wait for it to be claimed.

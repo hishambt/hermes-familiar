@@ -517,12 +517,132 @@ check(
     str(wrong_field)[:200],
 )
 
-refused = result_of({"id": "read-9", "action": "api", "method": "DELETE", "path": f"/api/sessions/{READ_ID}"})
+# A path this machine does not answer AT ALL: DELETE on a session is carried (below), so the refusal has to
+# be asked somewhere nothing is served, or the check would be testing the feature it names.
+refused = result_of({"id": "read-9", "action": "api", "method": "DELETE", "path": f"/api/sessions/{READ_ID}/nothing-here"})
 check("a path this machine does not answer is refused rather than faked", refused.get("status") == 501, str(refused)[:160])
 check(
     "naming what was asked and that it cannot answer it",
     "DELETE" in json.dumps(refused.get("body") or {}) and "does not answer" in json.dumps(refused.get("body") or {}),
     str(refused.get("body")),
+)
+
+# 4d. The rest of the surface: branching, deleting, the model picker, and the machine's own schedule.
+#
+# Same door, same shape: what the app asks an addressed instance over HTTP is answered here from this machine's
+# own state, so a machine with no address can do everything a conversation needs - start a topic from a session,
+# forget one, fill the model picker, and hold its own schedule.
+print("\nwhat else a paired machine answers")
+
+forked = result_of({"id": "more-1", "action": "api", "method": "POST",
+	"path": f"/api/sessions/{READ_ID}/fork", "body": {"title": "Branched here"}})
+fork_body = forked.get("body") or {}
+fork_session = fork_body.get("session") or {}
+check(
+    "a fork is created and answered as the API answers it",
+    forked.get("status") == 201 and fork_body.get("object") == "hermes.session",
+    str(forked)[:160],
+)
+check(
+    "under an id of its own, minted where the machine mints one",
+    bool(fork_session.get("id")) and fork_session.get("id") != READ_ID,
+    str(fork_session.get("id")),
+)
+check(
+    "carrying the conversation it branched from",
+    fork_session.get("parent_session_id") == READ_ID,
+    str(fork_session.get("parent_session_id")),
+)
+check("with the name that was asked for", fork_session.get("title") == "Branched here", str(fork_session.get("title")))
+fork_id = str(fork_session.get("id") or "")
+
+_db = acquire(Path(get_hermes_home()) / "state.db")
+try:
+    _source = _db.get_session(READ_ID) or {}
+    _branch = _db.get_messages(fork_id) if fork_id else []
+    check(
+        "and the source is ENDED as branched, which is what makes it a branch rather than a copy",
+        _source.get("end_reason") == "branched",
+        str(_source.get("end_reason")),
+    )
+    check("while the branch holds the messages it copied", len(_branch) == 2, str(len(_branch)))
+finally:
+    release_or_close(_db)
+
+deleted = result_of({"id": "more-2", "action": "api", "method": "DELETE", "path": f"/api/sessions/{fork_id}"})
+check(
+    "a conversation can be forgotten, and the answer says what it did",
+    deleted.get("status") == 200 and (deleted.get("body") or {}).get("deleted") is True,
+    str(deleted)[:160],
+)
+gone = result_of({"id": "more-3", "action": "api", "method": "GET", "path": f"/api/sessions/{fork_id}"})
+check("and it is gone afterwards", gone.get("status") == 404, str(gone)[:120])
+
+picked = result_of({"id": "more-4", "action": "api", "method": "GET", "path": "/api/model/options"})
+check(
+    "the model picker's inventory is answered from this machine",
+    picked.get("status") == 200 and isinstance((picked.get("body") or {}).get("providers"), list),
+    str(picked)[:200],
+)
+
+made = result_of({"id": "more-5", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Made down the connection", "schedule": "0 4 * * *", "prompt": "say hello", "deliver": "familiar"}})
+job = (made.get("body") or {}).get("job") or {}
+check("a job can be created on this machine", made.get("status") == 200 and bool(job.get("id")), str(made)[:200])
+check(
+    "as THIS channel's job, so `origin` means where Familiar is",
+    (job.get("origin") or {}).get("platform") == "familiar",
+    str(job.get("origin")),
+)
+job_id = str(job.get("id") or "")
+
+listed = result_of({"id": "more-6", "action": "api", "method": "GET", "path": "/api/jobs"})
+check(
+    "and the machine's own schedule lists it",
+    job_id and job_id in json.dumps(listed.get("body") or {}),
+    str(listed)[:160],
+)
+
+patched = result_of({"id": "more-7", "action": "api", "method": "PATCH", "path": f"/api/jobs/{job_id}",
+	"body": {"name": "Renamed down the connection"}})
+check(
+    "a job's own fields can be changed",
+    ((patched.get("body") or {}).get("job") or {}).get("name") == "Renamed down the connection",
+    str(patched)[:200],
+)
+
+refused_field = result_of({"id": "more-8", "action": "api", "method": "PATCH", "path": f"/api/jobs/{job_id}",
+	"body": {"script": "/tmp/probe.sh"}})
+check(
+    "a field nobody may set is refused rather than stored",
+    refused_field.get("status") == 400,
+    str(refused_field)[:200],
+)
+
+paused = result_of({"id": "more-9", "action": "api", "method": "POST", "path": f"/api/jobs/{job_id}/pause"})
+check(
+    "a job can be paused from here",
+    paused.get("status") == 200 and not ((paused.get("body") or {}).get("job") or {}).get("enabled"),
+    str(paused)[:200],
+)
+resumed = result_of({"id": "more-10", "action": "api", "method": "POST", "path": f"/api/jobs/{job_id}/resume"})
+check(
+    "and put back on the schedule",
+    resumed.get("status") == 200 and bool(((resumed.get("body") or {}).get("job") or {}).get("enabled")),
+    str(resumed)[:200],
+)
+
+bad_id = result_of({"id": "more-11", "action": "api", "method": "POST", "path": "/api/jobs/not-a-job-id/run"})
+check("an id that is not a job id is refused, rather than run", bad_id.get("status") == 400, str(bad_id)[:160])
+
+missing_job = result_of({"id": "more-12", "action": "api", "method": "GET", "path": "/api/jobs/aaaaaaaaaaaa"})
+check("a job this machine does not have is a 404", missing_job.get("status") == 404, str(missing_job)[:160])
+
+removed = result_of({"id": "more-13", "action": "api", "method": "DELETE", "path": f"/api/jobs/{job_id}"})
+check(
+    "and a job can be taken off the schedule",
+    removed.get("status") == 200 and (removed.get("body") or {}).get("ok") is True,
+    str(removed)[:160],
 )
 
 # 5. The asks: a question, a permission, and the gateway's own hold on a command it will not undo.

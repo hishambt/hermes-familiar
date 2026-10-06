@@ -1,7 +1,7 @@
 name: familiar-platform
 label: Familiar
 kind: platform
-version: 2.2.0
+version: 2.3.0
 description: >
   The channel a Familiar client reaches a Hermes machine through: the machine dials out and holds one
   connection, and messages, asks and reads all travel over it.
@@ -17,7 +17,8 @@ description: >
   their answer comes back with.
 
   Reach: a machine behind NAT has no address and no key on it, so it pairs by code and is asked down the
-  connection it holds - its conversations included, answered from Hermes' own state in the API's own shape.
+  connection it holds. Its conversations, the model picker's inventory and its whole cron schedule are
+  answered from Hermes' own state, in the API's own shape, and a path it cannot serve is refused by name.
 
   Standard library only. Settings live in config.yaml (platforms.familiar.extra) with FAMILIAR_* env vars
   as the fallback.
