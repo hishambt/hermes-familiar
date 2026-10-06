@@ -11,7 +11,9 @@ Standard library only, MIT licensed.
 hermes plugins install hishambt/hermes-familiar --enable
 ```
 
-That is the whole of it on a machine that has `git` and a way out to GitHub. For one without either, unpack the
+That is the whole of it on a machine that has `git` and a way out to GitHub. Hermes scans a plugin from an
+unreviewed source as it installs and prints a warning line saying so: this one scans safe, and the warning is the
+scanner telling you it looked. For a machine without `git`, unpack the
 archive from the [latest release](https://github.com/hishambt/hermes-familiar/releases/latest) into the
 directory Hermes reads plugins from. The archive's own top level is `familiar-platform/`, so it lands exactly
 where `hermes plugins enable` looks:
