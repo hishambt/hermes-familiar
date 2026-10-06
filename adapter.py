@@ -1,4 +1,4 @@
-"""Familiar platform adapter for Hermes: delivery only, over HTTP.
+"""Familiar platform adapter for Hermes: the channel a Familiar client reaches a machine through.
 
 Familiar is a client for Hermes instances. It reads an instance's sessions and jobs over the instance's own
 HTTP API, but a cron job's OUTPUT is pushed and never read: the Jobs API carries status alone. This adapter
@@ -9,9 +9,9 @@ target (``cron/scheduler_delivery.py`` -> ``_is_known_delivery_platform``), and 
 the delivery path needs. So a job's output lands in Familiar instead of in a file on the instance that no
 client can read.
 
-Nothing arrives over it. Familiar talks to the instance on the instance's API, so this platform has no
-inbound path and never carries a turn: ``interactive_resume`` and ``supports_async_delivery`` are both
-False, and no ``platform_hint`` is set because no session ever runs here.
+A person's message arrives at this machine's own loopback ingress and becomes a turn - ``interactive_resume``
+is True, because Familiar has somebody sitting in front of it. ``supports_async_delivery`` stays False and no
+``platform_hint`` is set.
 
 Settings, ``config.yaml platforms.familiar.extra.<key>`` first and the env var second (``extra`` wins):
 
@@ -33,11 +33,13 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
@@ -60,6 +62,16 @@ CHANNEL_STREAM_PATH = "/api/channel/stream"
 CHANNEL_REPLY_PATH = "/api/channel/reply"
 CHANNEL_PAIR_PATH = "/api/channel/pair"
 CHANNEL_PAIR_WAIT_PATH = "/api/channel/pair/wait"
+
+#: What a paired machine answers out of its OWN state. These are the paths the app already reads over an
+#: instance's HTTP API, answered from Hermes' own store and in the same shape - because the app parses one
+#: shape, and a second one would be a second source of truth. A path that is not here is refused by name.
+_API_ROUTES = (
+	("GET", r"/api/sessions", "_api_list_sessions"),
+	("GET", r"/api/sessions/(?P<session>[^/]+)", "_api_get_session"),
+	("GET", r"/api/sessions/(?P<session>[^/]+)/messages", "_api_session_messages"),
+	("PATCH", r"/api/sessions/(?P<session>[^/]+)", "_api_patch_session"),
+)
 
 #: Where a paired machine keeps the token it was given. Beside the plugin, because it belongs to the INSTALL and
 #: not to a Hermes config: nothing a reader edits by hand should hold a credential that arrives by pairing.
@@ -228,6 +240,18 @@ def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[s
 	}
 
 
+def _user_agent(payload: Dict[str, Any]) -> str:
+	"""Who is calling, for the far end's logs.
+
+	A delivery names its instance; a channel reply has no instance in it, because the request id it is
+	answered under is the whole address. So the name is left out rather than invented - which is also what a
+	missing key used to do here, by raising into the one path that owes an answer.
+	"""
+	instance = str(payload.get("instance") or "").strip()
+
+	return f"hermes-familiar (instance:{instance})" if instance else "hermes-familiar"
+
+
 def _post(url: str, token: str, payload: Dict[str, Any], path: str = NOTIFY_PATH) -> Dict[str, Any]:
 	"""One POST to Familiar, run in a worker thread. Returns its parsed response body.
 
@@ -241,7 +265,7 @@ def _post(url: str, token: str, payload: Dict[str, Any], path: str = NOTIFY_PATH
 		headers={
 			"Content-Type": "application/json",
 			"Authorization": f"Bearer {token}",
-			"User-Agent": f"hermes-familiar (instance:{payload['instance']})",
+			"User-Agent": _user_agent(payload),
 		},
 	)
 	try:
@@ -329,6 +353,59 @@ def is_connected(config) -> bool:
 	"""
 	return validate_config(config)
 
+
+# -- The shapes a client parses -------------------------------------------------
+
+
+def _api_error(message: str, code: str) -> Dict[str, Any]:
+	"""Hermes' own error envelope, so a refusal reads the same through either door."""
+	return {"error": {"message": message, "type": "invalid_request_error", "param": None, "code": code}}
+
+
+def _session_payload(session: Dict[str, Any]) -> Dict[str, Any]:
+	"""One session, in the shape the instance's API answers with.
+
+	The fields are the API server's own client-safe list (``api_server.py::_session_response``): a full system
+	prompt or model config never crosses a client surface, only whether one is there. Copied deliberately and kept
+	identical, because the app parses that shape and a second one would drift from it.
+	"""
+	safe_keys = (
+		"id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
+		"message_count", "tool_call_count", "input_tokens", "output_tokens",
+		"cache_read_tokens", "cache_write_tokens", "reasoning_tokens", "estimated_cost_usd",
+		"actual_cost_usd", "api_call_count", "parent_session_id", "last_active", "preview",
+		"_lineage_root_id", "pinned", "archived", "hidden")
+	payload = {key: session.get(key) for key in safe_keys if key in session}
+	# SQLite stores the flags as 0/1.
+	payload.update({flag: bool(payload[flag]) for flag in ("pinned", "archived", "hidden") if flag in payload})
+	payload["has_system_prompt"] = bool(session.get("system_prompt"))
+	payload["has_model_config"] = bool(session.get("model_config"))
+
+	return payload
+
+
+def _message_payload(message: Dict[str, Any]) -> Dict[str, Any]:
+	"""One message, in the shape the instance's API answers with (``api_server.py::_message_response``).
+
+	Compaction scaffolding is stripped the same way: a standalone handoff becomes a hidden empty row with a stable
+	id, and a merged one keeps only the real prior-tail content.
+	"""
+	from agent.compaction_display import (
+		_COMPACTION_INTERNAL_FIELDS, project_compaction_message_for_display)
+
+	projected = project_compaction_message_for_display(message)
+
+	if projected is None:
+		projected = {key: value for key, value in message.items() if key not in _COMPACTION_INTERNAL_FIELDS}
+		projected["content"] = ""
+		projected["display_kind"] = "hidden"
+
+	safe_keys = (
+		"id", "session_id", "role", "content", "tool_call_id", "tool_calls", "tool_name",
+		"timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
+		"display_kind")
+
+	return {key: projected.get(key) for key in safe_keys if key in projected}
 
 class FamiliarAdapter(BasePlatformAdapter):
 	"""Familiar as a channel: what a person says here reaches the agent, and its asks reach them."""
@@ -516,9 +593,10 @@ class FamiliarAdapter(BasePlatformAdapter):
 	async def _answer_request(self, frame: Dict[str, Any], token: str) -> None:
 		"""Do what Familiar asked down the channel, and answer with the id it came with.
 
-		What arrives this way is the same thing the ingress carries - a setting changed in the app - so it goes
-		through the same handler: one implementation, two doors, and no second idea of what setting a model means.
-		An answer is owed either way, because the app is waiting on this id and nothing else will settle it.
+		Three things arrive this way. A SETTING changed in the app goes through the same handler the ingress uses
+		- one implementation, two doors, and no second idea of what setting a model means. A MESSAGE is handed to
+		this machine's own ingress, and a READ is answered from Hermes' own state. An answer is owed either way,
+		because the app is waiting on this id and nothing else will settle it.
 		"""
 		request_id = str(frame.get("id") or "")
 		channel = str(frame.get("channel") or self._home)
@@ -527,6 +605,10 @@ class FamiliarAdapter(BasePlatformAdapter):
 		try:
 			if action == "say":
 				result = await self._channel_say(frame)
+			elif action == "api":
+				# A READ rather than a setting: the app asks a PATH instead of an address, so the answer is
+				# Hermes' own shape of it.
+				result = await self._channel_api(frame)
 			else:
 				known = await self._apply_action(frame, channel)
 				result = {"ok": True} if known else {"error": f"unknown action: {action}"}
@@ -574,6 +656,190 @@ class FamiliarAdapter(BasePlatformAdapter):
 					return {"error": f"the ingress answered HTTP {response.status}"}
 
 				return {"sessionId": body.get("sessionId")}
+
+	async def _channel_api(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+		"""Answer a path Familiar asked for, from THIS machine's own state.
+
+		A paired machine has no address and no key, so nothing that reads an instance over HTTP applies to it: what
+		used to be a request to Hermes' API arrives here as a path. The answer is that API's own shape, because the
+		app parses one shape and this is the machine's honest half of it.
+
+		A path this machine does not answer is refused BY NAME: an empty success would read as an empty
+		conversation, and the reader would believe it.
+		"""
+		method = str(frame.get("method") or "GET").upper()
+		split = urllib.parse.urlsplit(str(frame.get("path") or ""))
+		path = split.path.rstrip("/") or "/"
+		query = urllib.parse.parse_qs(split.query)
+
+		for route_method, pattern, handler in _API_ROUTES:
+			match = re.fullmatch(pattern, path)
+
+			if match and route_method == method:
+				return await getattr(self, handler)(match.groupdict(), query, frame.get("body"))
+
+		return {"status": 501, "body": _api_error(f"this machine does not answer {method} {path}", "unsupported_path")}
+
+	async def _with_session_db(self, work: Any) -> Any:
+		"""Run ``work(db)`` off the event loop, against this machine's own session store.
+
+		The store is SQLite, so it never runs on the loop, and the handle goes back to the registry rather than
+		being held - which is how the API server opens it too: one store per Hermes home.
+		"""
+		def run() -> Any:
+			from hermes_constants import get_hermes_home
+			from hermes_state_registry import acquire, release_or_close
+
+			db = acquire(Path(get_hermes_home()) / "state.db")
+
+			try:
+				return work(db)
+			finally:
+				release_or_close(db)
+
+		return await asyncio.to_thread(run)
+
+	@staticmethod
+	def _bounded(query: Dict[str, List[str]], key: str, default: int, maximum: int) -> int:
+		"""A page size or an offset, clamped the way the API server clamps it."""
+		try:
+			value = int((query.get(key) or [str(default)])[0])
+		except (TypeError, ValueError):
+			return default
+
+		return default if value < 0 else min(value, maximum)
+
+	@staticmethod
+	def _no_such_session(session_id: str) -> Dict[str, Any]:
+		return {"status": 404, "body": _api_error(f"Session not found: {session_id}", "session_not_found")}
+
+	async def _api_list_sessions(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /api/sessions - this machine's own sessions, most recently active first."""
+		limit = self._bounded(query, "limit", 50, 200)
+		offset = self._bounded(query, "offset", 0, 1_000_000)
+		source = (query.get("source") or [""])[0] or None
+		include_children = (query.get("include_children") or [""])[0].lower() in ("1", "true", "yes")
+		sessions = await self._with_session_db(
+			lambda db: db.list_sessions_rich(
+				source=source, limit=limit, offset=offset, include_children=include_children,
+				order_by_last_active=True, include_pinned=True))
+		# Pins are back-filled PAST the limit, so only the recency window decides whether another page exists.
+		windowed = sum(1 for session in sessions if not session.get("pinned"))
+
+		return {"status": 200, "body": {
+			"object": "list", "data": [_session_payload(session) for session in sessions],
+			"limit": limit, "offset": offset, "has_more": windowed >= limit}}
+
+	async def _api_get_session(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /api/sessions/{id} - one session, which is the cheap question "has anything changed?"."""
+		session = await self._with_session_db(lambda db: db.get_session(groups["session"]))
+
+		if not session:
+			return self._no_such_session(groups["session"])
+
+		return {"status": 200, "body": {"object": "hermes.session", "session": _session_payload(session)}}
+
+	async def _api_session_messages(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /api/sessions/{id}/messages - a conversation's transcript, paginated the API's own way."""
+		session_id = groups["session"]
+		order = (query.get("order") or [None])[0]
+
+		if order not in (None, "oldest", "latest"):
+			return {"status": 400, "body": _api_error("order must be one of: oldest, latest", "invalid_pagination")}
+
+		raw_limit = (query.get("limit") or [None])[0]
+		raw_offset = (query.get("offset") or ["0"])[0]
+
+		try:
+			offset = int(raw_offset)
+			requested = None if raw_limit is None else int(raw_limit)
+		except (TypeError, ValueError):
+			offset = requested = -1
+
+		if offset < 0 or (requested is not None and requested < 0):
+			return {"status": 400, "body": _api_error(
+				"limit and offset must be non-negative integers", "invalid_pagination")}
+
+		# No limit asked for means the LATEST page, which is what the app reads when it opens a thread.
+		default_page = requested is None
+		latest_page = order == "latest" or (order is None and default_page)
+		limit = 500 if default_page else min(requested, 500)
+
+		def work(db: Any) -> Any:
+			if not db.get_session(session_id):
+				return None
+
+			# The id asked about resolves to the session that actually holds the messages: a compression rotates
+			# the session under a conversation without changing the conversation.
+			resolved = db.resolve_resume_session_id(session_id)
+
+			return (resolved, db.get_messages(resolved, limit=limit, offset=offset, latest=latest_page))
+
+		answer = await self._with_session_db(work)
+
+		if answer is None:
+			return self._no_such_session(session_id)
+
+		resolved, messages = answer
+
+		return {"status": 200, "body": {
+			"object": "list", "session_id": resolved,
+			"data": [_message_payload(message) for message in messages],
+			"pagination": {"limit": limit, "offset": offset,
+				"order": order or ("latest" if default_page else "oldest"), "returned": len(messages)}}}
+
+	async def _api_patch_session(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""PATCH /api/sessions/{id} - what the app changes about a session it did not create: its name.
+
+		The machine's own flags are carried too, because the app relays them; a field this does not know is
+		refused by name rather than accepted and ignored.
+		"""
+		session_id = groups["session"]
+		fields = body if isinstance(body, dict) else {}
+		unknown = sorted(set(fields) - {"title", "end_reason", "pinned", "archived", "hidden", "unread"})
+
+		if unknown:
+			return {"status": 400, "body": _api_error(
+				f"Unsupported session fields: {', '.join(unknown)}", "unsupported_session_field")}
+
+		for flag in ("pinned", "archived", "hidden", "unread"):
+			if flag in fields and not isinstance(fields[flag], bool):
+				return {"status": 400, "body": _api_error(f"'{flag}' must be a boolean", "invalid_session_field")}
+
+		def work(db: Any) -> Any:
+			if not db.get_session(session_id):
+				return None
+
+			if "title" in fields:
+				db.set_session_title(session_id, "" if fields["title"] is None else str(fields["title"]))
+			# Pinned last: set_session_pinned clears hidden, so a pin in the same request wins over an explicit
+			# hidden - the same order the API server uses.
+			for flag, setter in (("archived", db.set_session_archived), ("hidden", db.set_session_hidden),
+			                     ("pinned", db.set_session_pinned)):
+				if flag in fields:
+					setter(session_id, fields[flag])
+			if "unread" in fields:
+				db.set_session_read(session_id, read=not fields["unread"])
+			if fields.get("end_reason"):
+				db.end_session(session_id, str(fields["end_reason"]))
+
+			return db.get_session(session_id)
+
+		try:
+			session = await self._with_session_db(work)
+		except ValueError as error:
+			# A name another session already holds: the machine says which one, and it is a 400 rather than a
+			# failure of the machine.
+			return {"status": 400, "body": _api_error(str(error), "invalid_title")}
+
+		if session is None:
+			return self._no_such_session(session_id)
+
+		return {"status": 200, "body": {"object": "hermes.session", "session": _session_payload(session)}}
 
 	async def _pair(self) -> None:
 		"""Ask Familiar for a code, show it, and wait for it to be claimed.

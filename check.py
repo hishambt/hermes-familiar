@@ -356,6 +356,175 @@ check(
     str(store.models[-1]),
 )
 
+# 4c. The read: what a machine with no address answers about its own conversations.
+#
+# A machine behind NAT has no address and no key, so nothing that reads an instance over HTTP applies to it. The
+# app asks down the connection instead - the same paths it would have asked an addressed instance - and this
+# machine answers them from Hermes' own store, in the API's own shape, because the app parses one shape.
+#
+# The conversations here are REAL rows in this run's temp HERMES_HOME, so the store opened is the one a gateway
+# would open, and what is asserted is what the machine actually reports about itself.
+print("\nthe read")
+
+from hermes_constants import get_hermes_home  # noqa: E402
+from hermes_state_registry import acquire, release_or_close  # noqa: E402
+
+READ_ID = "20261006_101500_readers01"
+OTHER_ID = "20261006_101600_readers02"
+
+
+def _seed_sessions() -> None:
+    db = acquire(Path(get_hermes_home()) / "state.db")
+    try:
+        for session_id, title in ((READ_ID, "Read me"), (OTHER_ID, "Somebody else")):
+            db.create_session(session_id, "familiar", model="deepseek-flash")
+            db.set_session_title(session_id, title)
+        db.append_message(READ_ID, "user", "what is in this directory?")
+        db.append_message(READ_ID, "assistant", "three files and a README")
+    finally:
+        release_or_close(db)
+
+
+_seed_sessions()
+
+
+def asked(frame: dict) -> dict:
+    """Ask this machine one path the way Familiar does, and hand back the answer it posted.
+
+    Through `_answer_request`, which is the real door: the answer travels back to the stub receiver exactly as it
+    travels back to Familiar, so what is asserted is what goes on the wire and not what a method returns.
+    """
+    before = len(RECEIVED)
+    asyncio.run(live._answer_request(frame, "tok_abc123"))
+
+    return RECEIVED[-1] if len(RECEIVED) == before + 1 else {}
+
+
+def result_of(frame: dict) -> dict:
+    """The result an answered request carried, and the proof it was posted at all."""
+    posted = asked(frame)
+    check(
+        f"an answer for {frame['method']} {frame['path'].split('?')[0]} is posted to the reply path",
+        posted.get("path") == "/api/channel/reply",
+        str(posted.get("path")),
+    )
+
+    return (posted.get("json") or {}).get("result") or {}
+
+
+listed = result_of({"id": "read-1", "action": "api", "method": "GET", "path": "/api/sessions"})
+check(
+    "a reply that names no instance still says who called",
+    RECEIVED[-1]["agent"] == "hermes-familiar",
+    str(RECEIVED[-1]["agent"]),
+)
+body = listed.get("body") or {}
+check(
+    "a list of conversations comes back in the API's own shape",
+    listed.get("status") == 200 and body.get("object") == "list",
+    str(listed)[:160],
+)
+row = next((item for item in body.get("data") or [] if item.get("id") == READ_ID), None)
+check("carrying the conversation this machine actually has", row is not None, str(body.get("data"))[:200])
+check("with its own title", (row or {}).get("title") == "Read me", str(row))
+check("and its flags as booleans, not as SQLite's 0/1", isinstance((row or {}).get("pinned"), bool), str(row))
+check("and no page beyond this one", body.get("has_more") is False, str(body.get("has_more")))
+
+one = result_of({"id": "read-2", "action": "api", "method": "GET", "path": f"/api/sessions/{READ_ID}"})
+session = (one.get("body") or {}).get("session") or {}
+check(
+    "one conversation is answered as the API answers it",
+    one.get("status") == 200 and (one.get("body") or {}).get("object") == "hermes.session",
+    str(one)[:160],
+)
+check("with a system prompt reported as present or not, never sent", "has_system_prompt" in session, str(session)[:160])
+check("and the instance's own count of what is in it", session.get("message_count") == 2, str(session.get("message_count")))
+
+messages = result_of({"id": "read-3", "action": "api", "method": "GET", "path": f"/api/sessions/{READ_ID}/messages"})
+transcript = messages.get("body") or {}
+check(
+    "a transcript is answered under the session it resolved to",
+    transcript.get("session_id") == READ_ID and transcript.get("object") == "list",
+    str(transcript)[:160],
+)
+check(
+    "with its messages in the API's shape",
+    [message.get("role") for message in transcript.get("data") or []] == ["user", "assistant"],
+    str(transcript.get("data"))[:200],
+)
+check(
+    "and how the page was read, which is what a caller pages with",
+    (transcript.get("pagination") or {}).get("order") == "latest"
+    and (transcript.get("pagination") or {}).get("returned") == 2,
+    str(transcript.get("pagination")),
+)
+
+page = result_of({
+    "id": "read-4", "action": "api", "method": "GET", "path": f"/api/sessions/{READ_ID}/messages?order=oldest&limit=1"})
+check(
+    "an explicit page is honoured",
+    (page.get("body") or {}).get("pagination") == {"limit": 1, "offset": 0, "order": "oldest", "returned": 1},
+    str((page.get("body") or {}).get("pagination")),
+)
+
+missing = result_of({"id": "read-5", "action": "api", "method": "GET", "path": "/api/sessions/nobody-has-this-one"})
+check(
+    "a conversation this machine does not have is a 404, not an empty one",
+    missing.get("status") == 404,
+    str(missing)[:160],
+)
+check(
+    "saying which one it could not find",
+    ((missing.get("body") or {}).get("error") or {}).get("code") == "session_not_found",
+    str(missing.get("body")),
+)
+
+renamed = result_of({
+    "id": "read-6", "action": "api", "method": "PATCH", "path": f"/api/sessions/{READ_ID}",
+    "body": {"title": "Renamed here"}})
+check(
+    "a rename is carried, and answered with the conversation as it now is",
+    (((renamed.get("body") or {}).get("session")) or {}).get("title") == "Renamed here",
+    str(renamed)[:160],
+)
+
+db = acquire(Path(get_hermes_home()) / "state.db")
+try:
+    check(
+        "and it landed on this machine, not only in the answer",
+        (db.get_session(READ_ID) or {}).get("title") == "Renamed here",
+        str((db.get_session(READ_ID) or {}).get("title")),
+    )
+finally:
+    release_or_close(db)
+
+taken = result_of({
+    "id": "read-7", "action": "api", "method": "PATCH", "path": f"/api/sessions/{READ_ID}",
+    "body": {"title": "Somebody else"}})
+check(
+    "a name another conversation already holds is refused",
+    taken.get("status") == 400 and ((taken.get("body") or {}).get("error") or {}).get("code") == "invalid_title",
+    str(taken)[:200],
+)
+
+wrong_field = result_of({
+    "id": "read-8", "action": "api", "method": "PATCH", "path": f"/api/sessions/{READ_ID}",
+    "body": {"nonsense": 1}})
+check(
+    "a field this machine does not know is refused by name rather than ignored",
+    wrong_field.get("status") == 400
+    and ((wrong_field.get("body") or {}).get("error") or {}).get("code") == "unsupported_session_field",
+    str(wrong_field)[:200],
+)
+
+refused = result_of({"id": "read-9", "action": "api", "method": "DELETE", "path": f"/api/sessions/{READ_ID}"})
+check("a path this machine does not answer is refused rather than faked", refused.get("status") == 501, str(refused)[:160])
+check(
+    "naming what was asked and that it cannot answer it",
+    "DELETE" in json.dumps(refused.get("body") or {}) and "does not answer" in json.dumps(refused.get("body") or {}),
+    str(refused.get("body")),
+)
+
 # 5. The asks: a question, a permission, and the gateway's own hold on a command it will not undo.
 print("\nasks")
 

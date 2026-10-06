@@ -1,9 +1,10 @@
 name: familiar-platform
 label: Familiar
 kind: platform
-version: 2.1.0
+version: 2.2.0
 description: >
-  Delivery-only gateway platform that pushes Hermes output to a Familiar client's notifications, over HTTP.
+  The channel a Familiar client reaches a Hermes machine through: the machine dials out and holds one
+  connection, and messages, asks and reads all travel over it.
 
   A cron job's output is pushed, never read: the instance's Jobs API carries status alone, so a job that
   ran looks identical to one whose words nobody can reach. Registering a platform with a cron delivery
@@ -11,8 +12,12 @@ description: >
   output goes. The same path carries Hermes' own send_message, so any event can notify a client, not only
   scheduled work.
 
-  Nothing arrives over it: Familiar reads an instance through the instance's own API, so this platform has
-  no inbound path, never carries a turn, and grants no way in.
+  Inbound: a person's message arrives at the machine's own loopback ingress and becomes a turn, and a tool
+  that needs permission, a clarify question and a slash confirmation are raised as asks carrying the id
+  their answer comes back with.
+
+  Reach: a machine behind NAT has no address and no key on it, so it pairs by code and is asked down the
+  connection it holds - its conversations included, answered from Hermes' own state in the API's own shape.
 
   Standard library only. Settings live in config.yaml (platforms.familiar.extra) with FAMILIAR_* env vars
   as the fallback.
