@@ -362,18 +362,38 @@ def _row_dict(cursor: Any, row: Any) -> Any:
 	return dict(row) if hasattr(row, "keys") else dict(zip([column[0] for column in cursor.description], row))
 
 
+def _session_select() -> str:
+	"""A session row, and when it was last used.
+
+	`last_active` is NOT a column: the machine derives it from the session's heartbeat, its newest message, and its
+	start. Asking for it the machine's own way is what keeps this route's answer the same shape as the reads beside
+	it, and a session's own recency is what tells two sessions of one conversation apart.
+	"""
+	from hermes_state_common import _sql_session_last_active
+
+	return f"SELECT s.*, {_sql_session_last_active('s')} AS _last_active FROM sessions s"
+
+
+def _with_recency(row: Any) -> Any:
+	"""The same row, with the derivation the machine makes of a session's recency in place of the raw column."""
+	if isinstance(row, dict):
+		row["last_active"] = row.pop("_last_active", None) or row.get("last_active")
+
+	return row
+
+
 def _one(conn: Any, sql: str, params: tuple) -> Any:
 	"""One row, or nothing."""
 	cursor = conn.execute(sql, params)
 
-	return _row_dict(cursor, cursor.fetchone())
+	return _with_recency(_row_dict(cursor, cursor.fetchone()))
 
 
 def _children(conn: Any, session_id: str) -> List[Dict[str, Any]]:
 	"""The sessions that point at this one, whole rows: a conversation's numbers live on each of them."""
-	cursor = conn.execute("SELECT * FROM sessions WHERE parent_session_id = ?", (session_id,))
+	cursor = conn.execute(f"{_session_select()} WHERE s.parent_session_id = ?", (session_id,))
 
-	return [row for row in (_row_dict(cursor, row) for row in cursor.fetchall()) if row]
+	return [row for row in (_with_recency(_row_dict(cursor, row)) for row in cursor.fetchall()) if row]
 
 
 def _conversation_total(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -398,7 +418,7 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 	`parent_session_id` for lineage. Its OWN session list hides those rows, so nothing downstream can see or count
 	them - the walk has to happen where the store is.
 	"""
-	start = _one(conn, "SELECT * FROM sessions WHERE id = ?", (session_id,))
+	start = _one(conn, f"{_session_select()} WHERE s.id = ?", (session_id,))
 
 	if start is None:
 		return {"sessions": [], "total": None}
@@ -415,7 +435,7 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 		if not parent_id or parent_id in seen:
 			break
 
-		parent = _one(conn, "SELECT * FROM sessions WHERE id = ?", (parent_id,))
+		parent = _one(conn, f"{_session_select()} WHERE s.id = ?", (parent_id,))
 
 		if parent is None or parent.get("end_reason") != CONTINUATION_END_REASON:
 			break

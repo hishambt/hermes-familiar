@@ -1126,6 +1126,12 @@ check(
     str(_from_mid["total"]["estimated_cost_usd"]),
 )
 
+check(
+    "every session of the conversation says when it was last used, the way the reads beside this one do",
+    all(row.get("last_active") for row in _from_mid["sessions"]),
+    str([row.get("last_active") for row in _from_mid["sessions"]]),
+)
+
 _from_root = _conversations(ROOT_ID)[1][ROOT_ID]
 check(
     "asking from the session the conversation STARTED in says the same thing",
