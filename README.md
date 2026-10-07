@@ -103,9 +103,10 @@ one that takes arguments:
 
 ### A conversation
 
-`GET /familiar/conversation?ids=<session id>,<session id>` on this machine, with the same bearer token, answers
-which sessions one conversation is and what they add up to. Ask about any of them - the one it started in, the
-middle, the one it is in now - and the answer is the same conversation.
+`GET /familiar/conversation?ids=<session id>,<session id>`, asked the way every read above is: down the connection
+this machine holds, so it works on a machine with no address. It answers which sessions one conversation is and
+what they add up to. Ask about any of them - the one it started in, the middle, the one it is in now - and the
+answer is the same conversation.
 
 The listing above cannot answer this on its own: Hermes' list hides the sessions a conversation was compressed
 into, so a reader of that list can neither see nor count them. The walk happens where the store is.

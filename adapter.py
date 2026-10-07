@@ -82,6 +82,9 @@ _API_ROUTES = (
 	("GET", r"/api/sessions/(?P<session>[^/]+)", "_api_get_session"),
 	("PATCH", r"/api/sessions/(?P<session>[^/]+)", "_api_patch_session"),
 	("DELETE", r"/api/sessions/(?P<session>[^/]+)", "_api_delete_session"),
+	# Not one of Hermes' paths: its own session list hides the sessions a conversation was compressed into, so
+	# the machine answers this one itself, out of the same store.
+	("GET", r"/familiar/conversation", "_api_conversation"),
 	("GET", r"/api/model/options", "_api_model_options"),
 	("GET", r"/api/jobs", "_api_list_jobs"),
 	("POST", r"/api/jobs", "_api_create_job"),
@@ -127,9 +130,6 @@ APPROVAL_PREFIX = "appr:"
 
 #: Loopback-only: what this machine answers when somebody asks it what code it is showing.
 PAIR_PATH = "/familiar/pair"
-#: What Familiar asks this machine about a conversation: which sessions one is, and what it has cost. One route
-#: answers both, because both are the same walk over the instance's own session rows.
-CONVERSATION_PATH = "/familiar/conversation"
 
 
 def _state_home() -> Path:
@@ -452,40 +452,21 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 	}
 
 
-def _session_store() -> Any:
-	"""This instance's session store, opened through Hermes the way its own readers open it.
+def _conversations_for(db: Any, ids: List[str]) -> Dict[str, Any]:
+	"""Walk each asked session to the conversation it belongs to, in the store the caller opened."""
+	conn = getattr(db, "_conn", None)
 
-	Late-imported: the plugin has to load on a machine whose Hermes does not have what it expects, and a reader has
-	no business keeping a second opinion about where the store lives.
-	"""
-	from hermes_state import _default_db_path
-	from hermes_state_registry import acquire
+	if conn is None:
+		raise RuntimeError("the session store came back without a connection to read")
 
-	return acquire(Path(_default_db_path()))
+	resolver = getattr(db, "resolve_session_id", None)
+	found: Dict[str, Any] = {}
 
+	for session_id in ids:
+		resolved = resolver(session_id) if resolver is not None else None
+		found[session_id] = _conversation(conn, resolved or session_id)
 
-def _conversations_for(ids: List[str]) -> Dict[str, Any]:
-	"""Walk each asked session to the conversation it belongs to."""
-	from hermes_state_registry import release_or_close
-
-	db = _session_store()
-
-	try:
-		conn = getattr(db, "_conn", None)
-
-		if conn is None:
-			raise RuntimeError("the session store came back without a connection to read")
-
-		resolver = getattr(db, "resolve_session_id", None)
-		found: Dict[str, Any] = {}
-
-		for session_id in ids:
-			resolved = resolver(session_id) if resolver is not None else None
-			found[session_id] = _conversation(conn, resolved or session_id)
-
-		return found
-	finally:
-		release_or_close(db)
+	return found
 
 
 class _DeliveryError(Exception):
@@ -854,8 +835,6 @@ class FamiliarAdapter(BasePlatformAdapter):
 		app.router.add_get(INGRESS_PATH, self._handle_ingress_probe)
 		# What a person standing at this machine can ask it: the pairing code, or that it is already paired.
 		app.router.add_get(PAIR_PATH, self._handle_pair_probe)
-		# What Familiar asks about the conversations it shows: which sessions one is, and what it cost.
-		app.router.add_get(CONVERSATION_PATH, self._handle_conversation)
 
 		runner = web.AppRunner(app, access_log=None)
 		await runner.setup()
@@ -1097,6 +1076,35 @@ class FamiliarAdapter(BasePlatformAdapter):
 	@staticmethod
 	def _no_such_session(session_id: str) -> Dict[str, Any]:
 		return {"status": 404, "body": _api_error(f"Session not found: {session_id}", "session_not_found")}
+
+	async def _api_conversation(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /familiar/conversation - which sessions one conversation is, and what they add up to.
+
+		A conversation outlives the session it started in: the instance compresses it onto a fresh id and keeps
+		`parent_session_id` for lineage. Its OWN session list hides those rows, so what a reader of that list can
+		see and count is one session of a conversation rather than the conversation - which is why this walk
+		happens where the store is.
+		"""
+		asked = [
+			part.strip()
+			for part in (query.get("ids") or query.get("session") or [""])[0].split(",")
+			if part.strip()
+		]
+
+		if not asked:
+			return {"status": 400, "body": _api_error("no session asked for", "invalid_request")}
+
+		if len(asked) > CONVERSATION_MAX_IDS:
+			return {
+				"status": 400,
+				"body": _api_error(f"at most {CONVERSATION_MAX_IDS} sessions per call", "invalid_request"),
+			}
+
+		return {
+			"status": 200,
+			"body": {"conversations": await self._with_session_db(lambda db: _conversations_for(db, asked))},
+		}
 
 	async def _api_list_sessions(
 			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
@@ -1694,41 +1702,6 @@ class FamiliarAdapter(BasePlatformAdapter):
 			logger.warning("[%s] Delivery failed: %s", self.name, error)
 			return SendResult(success=False, error=str(error), retryable=error.retryable)
 		return SendResult(success=True, message_id=str(body["id"]) if body.get("id") else None)
-	async def _handle_conversation(self, request: Any) -> Any:
-		"""The sessions one conversation is, and what they add up to.
-
-		Asked by Familiar, which holds a token this machine issued it. The answer is the instance's own rows, so a
-		conversation that was compressed onto a fresh session id is still one conversation here.
-		"""
-		from aiohttp import web
-
-		presented = request.headers.get("Authorization", "")
-		expected = self._ingress_token or self._token
-
-		if not expected or presented != f"Bearer {expected}":
-			logger.warning("[familiar] refused a conversation call: bad or missing token")
-			return web.json_response({"error": "unauthorized"}, status=401)
-
-		asked = [
-			part.strip()
-			for part in (request.query.get("ids") or request.query.get("session") or "").split(",")
-			if part.strip()
-		]
-
-		if not asked:
-			return web.json_response({"error": "no session asked for"}, status=400)
-
-		if len(asked) > CONVERSATION_MAX_IDS:
-			return web.json_response({"error": f"at most {CONVERSATION_MAX_IDS} sessions per call"}, status=400)
-
-		try:
-			conversations = await asyncio.get_running_loop().run_in_executor(None, _conversations_for, asked)
-		except Exception as error:  # noqa: BLE001 - an unreadable store is an answer, not a crash
-			logger.warning("[familiar] could not read the session store: %s", error)
-			return web.json_response({"error": "session store unavailable"}, status=503)
-
-		return web.json_response({"conversations": conversations})
-
 	async def _handle_ingress_probe(self, request: Any) -> Any:
 		"""A health probe: whether this instance can be reached at all."""
 		from aiohttp import web
