@@ -1575,25 +1575,29 @@ class FamiliarAdapter(BasePlatformAdapter):
 		# A tapped choice on a clarify question. Resolved here for a reason that is not stylistic: the gateway
 		# resolves a TYPED reply only when it is a number or one of the labels, and reads anything else as prose -
 		# so a callback id handed over as text leaves the agent parked AND lands in the conversation as the
-		# reader's own words. The tap is answered as the choice it is, and the conversation is told the choice in
-		# its own words, so a turn reads as the answer it was.
+		# reader's own words.
+		#
+		# It is NOT handed over afterwards either. A tap is an answer, not something the reader said: handing the
+		# choice to the gateway as a message makes a turn of it, and what a turn records is the runtime's own
+		# preamble for an inbound gateway message - so the conversation ends up showing that instead of the choice.
+		# The agent receives the choice where it asked for it, as the answer to its own question.
 		if text.startswith(CLARIFY_PREFIX):
 			said = await self._resolve_clarify(text, chat_id)
 
-			if not said:
-				return web.json_response({"ok": True})
+			if said:
+				logger.info("[%s] A tap answered the clarify as %s", self.name, said)
 
-			text = said
+			return web.json_response({"ok": True})
 
 		# A decision on an approval this adapter raised. Same reasoning as a tap on a question: the callback id is
 		# a wire format, and handing it to the gateway as text decides nothing.
 		if text.startswith(APPROVAL_PREFIX):
 			decision = await self._resolve_approval(text, chat_id)
 
-			if not decision:
-				return web.json_response({"ok": True})
+			if decision:
+				logger.info("[%s] A decision answered the approval as %s", self.name, decision)
 
-			text = decision
+			return web.json_response({"ok": True})
 
 		source = self.build_source(
 			chat_id=chat_id,
@@ -1950,12 +1954,12 @@ class FamiliarAdapter(BasePlatformAdapter):
 		return choice
 
 	async def _resolve_clarify(self, text: str, chat_id: str) -> str:
-		"""Resolve the clarify the reader tapped, and answer with the choice in its own words.
+		"""Resolve the clarify the reader tapped, answering with the choice in its own words.
 
 		A tap carries the id the question was asked with and the position picked, because that is the callback
 		every adapter's buttons build. Nothing about it is printable, so the choice is looked up from what this
-		adapter remembered asking, resolved through the gateway's own tool, and said in the conversation as the
-		words of the choice - which is what makes the turn read as an answer afterwards.
+		adapter remembered asking and handed to the gateway's own tool, which is where the agent is blocked and
+		where it will read the choice as the answer to its question.
 
 		Empty when there is nothing left to answer: an answered or expired question is not an error, but the reader
 		still deserves to be told nothing was done.

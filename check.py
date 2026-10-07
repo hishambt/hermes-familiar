@@ -925,6 +925,8 @@ _clarify_gateway.register("cl_tap", SESSION_KEY, "Which store?", ["postgres", "s
 live._clarifies["cl_tap"] = (SESSION_KEY, ["postgres", "sqlite"])
 _said = asyncio.run(live._resolve_clarify("cl:cl_tap:1", "default"))
 check("a tapped choice resolves the clarify it was asked on", _said == "2. sqlite", repr(_said))
+check("and the agent reads the CHOICE where it asked, not a message of its own",
+      _clarify_gateway.wait_for_response("cl_tap", 0.1) == "sqlite", "the agent did not read the choice")
 check("and the question stops waiting", _clarify_gateway.get_pending_for_session(SESSION_KEY) is None)
 check("a tap that arrives too late says so rather than deciding anything",
       asyncio.run(live._resolve_clarify("cl:cl_tap:1", "default")) == "", "a stale tap resolved something")
