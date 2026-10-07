@@ -127,6 +127,9 @@ APPROVAL_PREFIX = "appr:"
 
 #: Loopback-only: what this machine answers when somebody asks it what code it is showing.
 PAIR_PATH = "/familiar/pair"
+#: What Familiar asks this machine about a conversation: which sessions one is, and what it has cost. One route
+#: answers both, because both are the same walk over the instance's own session rows.
+CONVERSATION_PATH = "/familiar/conversation"
 
 
 def _state_home() -> Path:
@@ -285,6 +288,204 @@ whole output in its own cron journal.
 """
 MAX_MESSAGE_LENGTH = 20_000
 TIMEOUT_SECONDS = 15.0
+
+
+#: The fields one session of a conversation is reported with: what the app draws, and nothing else of the row.
+CONVERSATION_FIELDS = (
+	"id",
+	"parent_session_id",
+	"end_reason",
+	"title",
+	"source",
+	"model",
+	"started_at",
+	"last_active",
+	"ended_at",
+	"message_count",
+	"tool_call_count",
+	"api_call_count",
+	"input_tokens",
+	"output_tokens",
+	"cache_read_tokens",
+	"cache_write_tokens",
+	"reasoning_tokens",
+	"estimated_cost_usd",
+	"actual_cost_usd",
+)
+
+#: What a conversation's total adds up.
+CONVERSATION_SUMS = (
+	"message_count",
+	"tool_call_count",
+	"api_call_count",
+	"input_tokens",
+	"output_tokens",
+	"cache_read_tokens",
+	"cache_write_tokens",
+	"reasoning_tokens",
+)
+
+#: How a parent ended when the conversation carried on in its child. The instance own word for it, and the ONLY
+#: link that means the same conversation: the same field carries a branch, a reset (a separate conversation by the
+#: instance own account) and a subagent run, and those are conversations of their own.
+CONTINUATION_END_REASON = "compression"
+
+#: A conversation is not this long. The walk stops rather than believing the store.
+CONVERSATION_MAX_LINKS = 200
+
+#: How many conversations one call may ask about - the history page asks about a page of rows at once.
+CONVERSATION_MAX_IDS = 50
+
+
+def _number(value: Any) -> float:
+	"""A stored count or cost as a number. Anything unreadable counts as nothing."""
+	if isinstance(value, bool) or value is None:
+		return 0.0
+
+	if isinstance(value, (int, float)):
+		return float(value)
+
+	try:
+		return float(value)
+	except (TypeError, ValueError):
+		return 0.0
+
+
+def _row_dict(cursor: Any, row: Any) -> Any:
+	"""One row as a dict, whether the connection hands back tuples or row objects."""
+	if row is None:
+		return None
+
+	if isinstance(row, dict):
+		return row
+
+	return dict(row) if hasattr(row, "keys") else dict(zip([column[0] for column in cursor.description], row))
+
+
+def _one(conn: Any, sql: str, params: tuple) -> Any:
+	"""One row, or nothing."""
+	cursor = conn.execute(sql, params)
+
+	return _row_dict(cursor, cursor.fetchone())
+
+
+def _children(conn: Any, session_id: str) -> List[Dict[str, Any]]:
+	"""The sessions that point at this one, whole rows: a conversation's numbers live on each of them."""
+	cursor = conn.execute("SELECT * FROM sessions WHERE parent_session_id = ?", (session_id,))
+
+	return [row for row in (_row_dict(cursor, row) for row in cursor.fetchall()) if row]
+
+
+def _conversation_total(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
+	"""What the sessions of one conversation add up to.
+
+	`estimated_cost_usd` stays null when no session in the chain reported one: a total nobody gave is not zero,
+	and the app decides what to draw from that.
+	"""
+	total: Dict[str, Any] = {field: sum(_number(row.get(field)) for row in chain) for field in CONVERSATION_SUMS}
+	reported = [row.get("estimated_cost_usd") for row in chain if row.get("estimated_cost_usd") is not None]
+
+	total["estimated_cost_usd"] = sum(_number(cost) for cost in reported) if reported else None
+	total["sessions"] = len(chain)
+
+	return total
+
+
+def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
+	"""The sessions one conversation is, oldest first, and what they add up to.
+
+	A conversation outlives the session it started in: the instance compresses it onto a fresh id and keeps
+	`parent_session_id` for lineage. Its OWN session list hides those rows, so nothing downstream can see or count
+	them - the walk has to happen where the store is.
+	"""
+	start = _one(conn, "SELECT * FROM sessions WHERE id = ?", (session_id,))
+
+	if start is None:
+		return {"sessions": [], "total": None}
+
+	seen = {start["id"]}
+	chain = [start]
+
+	# Up to the session the conversation started in. Every step is a link whose parent ended by compressing.
+	current = start
+
+	for _ in range(CONVERSATION_MAX_LINKS):
+		parent_id = current.get("parent_session_id")
+
+		if not parent_id or parent_id in seen:
+			break
+
+		parent = _one(conn, "SELECT * FROM sessions WHERE id = ?", (parent_id,))
+
+		if parent is None or parent.get("end_reason") != CONTINUATION_END_REASON:
+			break
+
+		seen.add(parent["id"])
+		chain.append(parent)
+		current = parent
+
+	# And down through every session it carried on into.
+	current = start
+
+	for _ in range(CONVERSATION_MAX_LINKS):
+		if current.get("end_reason") != CONTINUATION_END_REASON:
+			break
+
+		carried = [child for child in _children(conn, current["id"]) if child["id"] not in seen]
+
+		if not carried:
+			break
+
+		carried.sort(key=lambda child: _number(child.get("started_at")))
+
+		for child in carried:
+			seen.add(child["id"])
+			chain.append(child)
+
+		current = carried[-1]
+
+	chain.sort(key=lambda row: _number(row.get("started_at")))
+
+	return {
+		"sessions": [{field: row.get(field) for field in CONVERSATION_FIELDS} for row in chain],
+		"total": _conversation_total(chain),
+	}
+
+
+def _session_store() -> Any:
+	"""This instance's session store, opened through Hermes the way its own readers open it.
+
+	Late-imported: the plugin has to load on a machine whose Hermes does not have what it expects, and a reader has
+	no business keeping a second opinion about where the store lives.
+	"""
+	from hermes_state import _default_db_path
+	from hermes_state_registry import acquire
+
+	return acquire(Path(_default_db_path()))
+
+
+def _conversations_for(ids: List[str]) -> Dict[str, Any]:
+	"""Walk each asked session to the conversation it belongs to."""
+	from hermes_state_registry import release_or_close
+
+	db = _session_store()
+
+	try:
+		conn = getattr(db, "_conn", None)
+
+		if conn is None:
+			raise RuntimeError("the session store came back without a connection to read")
+
+		resolver = getattr(db, "resolve_session_id", None)
+		found: Dict[str, Any] = {}
+
+		for session_id in ids:
+			resolved = resolver(session_id) if resolver is not None else None
+			found[session_id] = _conversation(conn, resolved or session_id)
+
+		return found
+	finally:
+		release_or_close(db)
 
 
 class _DeliveryError(Exception):
@@ -653,6 +854,8 @@ class FamiliarAdapter(BasePlatformAdapter):
 		app.router.add_get(INGRESS_PATH, self._handle_ingress_probe)
 		# What a person standing at this machine can ask it: the pairing code, or that it is already paired.
 		app.router.add_get(PAIR_PATH, self._handle_pair_probe)
+		# What Familiar asks about the conversations it shows: which sessions one is, and what it cost.
+		app.router.add_get(CONVERSATION_PATH, self._handle_conversation)
 
 		runner = web.AppRunner(app, access_log=None)
 		await runner.setup()
@@ -1491,6 +1694,41 @@ class FamiliarAdapter(BasePlatformAdapter):
 			logger.warning("[%s] Delivery failed: %s", self.name, error)
 			return SendResult(success=False, error=str(error), retryable=error.retryable)
 		return SendResult(success=True, message_id=str(body["id"]) if body.get("id") else None)
+	async def _handle_conversation(self, request: Any) -> Any:
+		"""The sessions one conversation is, and what they add up to.
+
+		Asked by Familiar, which holds a token this machine issued it. The answer is the instance's own rows, so a
+		conversation that was compressed onto a fresh session id is still one conversation here.
+		"""
+		from aiohttp import web
+
+		presented = request.headers.get("Authorization", "")
+		expected = self._ingress_token or self._token
+
+		if not expected or presented != f"Bearer {expected}":
+			logger.warning("[familiar] refused a conversation call: bad or missing token")
+			return web.json_response({"error": "unauthorized"}, status=401)
+
+		asked = [
+			part.strip()
+			for part in (request.query.get("ids") or request.query.get("session") or "").split(",")
+			if part.strip()
+		]
+
+		if not asked:
+			return web.json_response({"error": "no session asked for"}, status=400)
+
+		if len(asked) > CONVERSATION_MAX_IDS:
+			return web.json_response({"error": f"at most {CONVERSATION_MAX_IDS} sessions per call"}, status=400)
+
+		try:
+			conversations = await asyncio.get_running_loop().run_in_executor(None, _conversations_for, asked)
+		except Exception as error:  # noqa: BLE001 - an unreadable store is an answer, not a crash
+			logger.warning("[familiar] could not read the session store: %s", error)
+			return web.json_response({"error": "session store unavailable"}, status=503)
+
+		return web.json_response({"conversations": conversations})
+
 	async def _handle_ingress_probe(self, request: Any) -> Any:
 		"""A health probe: whether this instance can be reached at all."""
 		from aiohttp import web

@@ -207,6 +207,10 @@ with without_env("FAMILIAR_TOKEN"):
     async def _unpaired_run():
         started = await unpaired_machine.connect()
         bound = unpaired_machine._ingress_runner is not None
+        # What the ingress actually serves: a route nothing registered is a route Familiar cannot ask.
+        served = [
+            getattr(route.resource, "canonical", "") for route in unpaired_machine._ingress_runner.app.router.routes()
+        ]
         code = await unpaired_machine._handle_pair_probe(None)
 
         # Asked with a code already in hand, the same endpoint hands back THAT code and starts nothing: it is what a
@@ -228,14 +232,19 @@ with without_env("FAMILIAR_TOKEN"):
 
         await unpaired_machine.disconnect()
 
-        return started, bound, code, held, refused, adopted
+        return started, bound, code, held, refused, adopted, served
 
-    _started, _bound, _code, _held, _refused, _adopted = asyncio.run(_unpaired_run())
+    _started, _bound, _code, _held, _refused, _adopted, _served = asyncio.run(_unpaired_run())
     check("connect() starts without a token, because the channel dials out", _started is True)
     # The code this machine shows is read from the pair endpoint ON the machine, and whoever reads it is sitting at
     # the machine that has not paired yet - the reader the guide sends there. A listener that waited for a token left
     # exactly that reader with nothing to read.
     check("and brings its ingress up with it, so the code can be read on the machine", _bound is True)
+    check(
+        "serving the conversation route Familiar asks a conversation about",
+        adapter.CONVERSATION_PATH in _served,
+        str(_served),
+    )
     check("the pair endpoint answers there, before any token exists", getattr(_code, "status", None) == 200, str(_code))
     # What it answers is the code in hand, and answering costs nothing: a reader who runs the command ONCE gets the
     # code, rather than a "not yet" they would have no way of knowing to ask again for.
@@ -1033,6 +1042,155 @@ check("carries no job id, because this signature has no metadata", RECEIVED[-1][
 with without_env("FAMILIAR_TOKEN"):
     tokenless_standalone = asyncio.run(adapter._standalone_send(config(url=URL), "default", "x"))
 check("refuses without a token too", "error" in tokenless_standalone, str(tokenless_standalone))
+
+# 12. The conversation route: which sessions one conversation is, and what it has cost.
+#
+# The instance own session list hides the sessions a conversation was compressed into, so a reader of that list
+# cannot see or count them. This route walks the store itself, and the walk is what these check.
+print("\nconversation (which sessions are one conversation)")
+
+ROOT_ID = "20261006_101700_chainroot1"
+MID_ID = "20261006_101800_chainmid12"
+TIP_ID = "20261006_101900_chaintip12"
+AFTER_RESET_ID = "20261006_102000_afterreset"
+SOLO_ID = "20261006_102100_solocost12"
+
+
+def _seed_conversation() -> None:
+    """One conversation in three sessions, and a fourth that is NOT part of it.
+
+    The link means the same conversation only when the PARENT ended by compressing. The fourth session points at
+    the tip, whose parent ended by reset - the instance own account of which is a separate conversation - so it
+    must stand on its own.
+    """
+    db = acquire(Path(get_hermes_home()) / "state.db")
+    try:
+        db.create_session(ROOT_ID, "familiar", model="deepseek-flash")
+        db.end_session(ROOT_ID, "compression")
+        db.create_session(MID_ID, "familiar", model="deepseek-flash", parent_session_id=ROOT_ID)
+        db.end_session(MID_ID, "compression")
+        db.create_session(TIP_ID, "familiar", model="deepseek-flash", parent_session_id=MID_ID)
+        db.end_session(TIP_ID, "session_reset")
+        db.create_session(AFTER_RESET_ID, "familiar", model="deepseek-flash", parent_session_id=TIP_ID)
+        db.create_session(SOLO_ID, "familiar", model="deepseek-flash")
+
+        usage = {
+            ROOT_ID: (5, 100, 0.25),
+            MID_ID: (7, 200, 0.5),
+            TIP_ID: (1, 50, None),
+            AFTER_RESET_ID: (2, 10, 0.02),
+            SOLO_ID: (3, 30, None),
+        }
+
+        for session_id, (messages, tokens, cost) in usage.items():
+            db._conn.execute(
+                "UPDATE sessions SET message_count = ?, input_tokens = ?, estimated_cost_usd = ? WHERE id = ?",
+                (messages, tokens, cost, session_id),
+            )
+
+        db._conn.commit()
+    finally:
+        release_or_close(db)
+
+
+_seed_conversation()
+
+
+class _QueryRequest:
+    """Enough of an aiohttp request for a GET route: a bearer header and a query."""
+
+    def __init__(self, query=None, token="tok_abc123"):
+        self.headers = {"Authorization": f"Bearer {token}"} if token else {}
+        self.query = query or {}
+
+
+def _conversation(query, token="tok_abc123"):
+    """Ask the route the way Familiar does, and hand back the parsed answer."""
+    response = asyncio.run(live._handle_conversation(_QueryRequest(query, token)))
+
+    return response, json.loads(response.body.decode("utf-8"))
+
+
+_from_mid, asked_from_mid = _conversation({"ids": MID_ID})
+_mid = asked_from_mid["conversations"][MID_ID]
+check(
+    "a session in the middle of a chain answers with the whole conversation, oldest first",
+    [row["id"] for row in _mid["sessions"]] == [ROOT_ID, MID_ID, TIP_ID],
+    str([row["id"] for row in _mid["sessions"]]),
+)
+check(
+    "and the row that ends the chain is the one the conversation carried on into",
+    [row["end_reason"] for row in _mid["sessions"]] == ["compression", "compression", "session_reset"],
+    str([row["end_reason"] for row in _mid["sessions"]]),
+)
+check(
+    "its total adds the chain up, sessions included",
+    _mid["total"]["sessions"] == 3
+    and _mid["total"]["message_count"] == 13
+    and _mid["total"]["input_tokens"] == 350,
+    str(_mid["total"]),
+)
+check(
+    "and the cost is what the sessions reported, with a session that reported none counted as none",
+    abs(_mid["total"]["estimated_cost_usd"] - 0.75) < 1e-9,
+    str(_mid["total"]["estimated_cost_usd"]),
+)
+
+_for_root, asked_from_root = _conversation({"ids": ROOT_ID})
+check(
+    "asking from the session the conversation STARTED in says the same thing",
+    [row["id"] for row in asked_from_root["conversations"][ROOT_ID]["sessions"]] == [ROOT_ID, MID_ID, TIP_ID],
+    str([row["id"] for row in asked_from_root["conversations"][ROOT_ID]["sessions"]]),
+)
+
+_for_after, asked_for_after = _conversation({"ids": AFTER_RESET_ID})
+_after = asked_for_after["conversations"][AFTER_RESET_ID]
+check(
+    "a session whose parent was RESET is its own conversation, not a continuation of the chain",
+    [row["id"] for row in _after["sessions"]] == [AFTER_RESET_ID],
+    str([row["id"] for row in _after["sessions"]]),
+)
+check(
+    "and it counts only itself",
+    _after["total"]["sessions"] == 1 and _after["total"]["message_count"] == 2,
+    str(_after["total"]),
+)
+
+_for_solo, asked_for_solo = _conversation({"ids": SOLO_ID})
+check(
+    "a conversation where nobody reported a cost reports NO cost, because a total nobody gave is not zero",
+    asked_for_solo["conversations"][SOLO_ID]["total"]["estimated_cost_usd"] is None,
+    str(asked_for_solo["conversations"][SOLO_ID]["total"]),
+)
+
+_for_unknown, asked_for_unknown = _conversation({"ids": "no-such-session-anywhere"})
+check(
+    "an unknown session answers with nothing rather than a guess",
+    asked_for_unknown["conversations"]["no-such-session-anywhere"] == {"sessions": [], "total": None},
+    str(asked_for_unknown),
+)
+
+_for_many, asked_for_many = _conversation({"ids": ",".join([ROOT_ID, MID_ID, TIP_ID])})
+check(
+    "one call answers about several conversations, keyed by what was asked",
+    sorted(asked_for_many["conversations"].keys()) == sorted([ROOT_ID, MID_ID, TIP_ID]),
+    str(list(asked_for_many["conversations"].keys())),
+)
+
+_refused, _ = _conversation({"ids": MID_ID}, token="")
+check("a call with no token is refused", _refused.status == 401, str(_refused.status))
+_wrong, _ = _conversation({"ids": MID_ID}, token="tok_somebody_else")
+check("and so is one with somebody else's", _wrong.status == 401, str(_wrong.status))
+
+_nothing, _ = _conversation({})
+check("a call that asks about nothing is refused, and says which", _nothing.status == 400, str(_nothing.status))
+
+_too_many, _ = _conversation({"ids": ",".join(f"s{n}" for n in range(adapter.CONVERSATION_MAX_IDS + 1))})
+check(
+    "and one that asks about more conversations than a page holds",
+    _too_many.status == 400,
+    str(_too_many.status),
+)
 
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:

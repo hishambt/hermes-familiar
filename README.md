@@ -101,6 +101,39 @@ one that takes arguments:
   ceiling is `total` `null`: count more than that and the machine is reading rows nobody asked for, and a number
   nobody read is worse than none. Show what you have; do not invent a number.
 
+### A conversation
+
+`GET /familiar/conversation?ids=<session id>,<session id>` on this machine, with the same bearer token, answers
+which sessions one conversation is and what they add up to. Ask about any of them - the one it started in, the
+middle, the one it is in now - and the answer is the same conversation.
+
+The listing above cannot answer this on its own: Hermes' list hides the sessions a conversation was compressed
+into, so a reader of that list can neither see nor count them. The walk happens where the store is.
+
+```json
+{
+  "conversations": {
+    "20261006_101800_chainmid12": {
+      "sessions": [
+        { "id": "20261006_101700_chainroot1", "end_reason": "compression", "message_count": 5, "estimated_cost_usd": 0.25, "...": "..." },
+        { "id": "20261006_101800_chainmid12", "end_reason": "compression", "message_count": 7, "estimated_cost_usd": 0.5, "...": "..." },
+        { "id": "20261006_101900_chaintip12", "end_reason": "session_reset", "message_count": 1, "estimated_cost_usd": null, "...": "..." }
+      ],
+      "total": { "sessions": 3, "message_count": 13, "input_tokens": 350, "estimated_cost_usd": 0.75 }
+    }
+  }
+}
+```
+
+- The sessions come **oldest first**, and each carries what the single-session read carries for it.
+- A link is only a continuation when the **parent ended by `compression`**. A branch, a reset - which the
+  instance's own account calls a separate conversation that merely keeps the pointer - and a subagent run are
+  conversations of their own, and their numbers are not this conversation's.
+- `total` adds the chain up. `estimated_cost_usd` is `null` when no session in the chain reported one: a total
+  nobody gave is not zero.
+- At most 50 ids per call, which is a page of rows in one request. An unknown id answers with no sessions rather
+  than a guess.
+
 ## Setup
 
 **A machine Familiar has a shell on needs none of this.** Familiar's own setup finds Hermes and runs the
