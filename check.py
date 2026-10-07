@@ -913,6 +913,23 @@ clarify = RECEIVED[-1]
 check("a clarify goes to the ask path", clarify["path"] == "/api/hermes/ask", clarify["path"])
 check("as a clarify", clarify["json"]["kind"] == "clarify", str(clarify["json"].get("kind")))
 check("carrying the id its answer comes back with", clarify["json"]["requestId"] == "cl_1", str(clarify["json"].get("requestId")))
+
+# A TAPPED CHOICE. The callback id is a wire format and reaches the gateway as text only by accident: the
+# gateway resolves a TYPED reply when it is a number or one of the labels and reads anything else as prose, so
+# an id handed over would leave the agent parked AND put the id in the conversation as the reader's own words.
+# It is resolved here instead, against a clarify this process actually registered, and answered with the words
+# of the choice - which is what the conversation is then told.
+from tools import clarify_gateway as _clarify_gateway  # noqa: E402 - the resolution under test
+
+_clarify_gateway.register("cl_tap", SESSION_KEY, "Which store?", ["postgres", "sqlite"])
+live._clarifies["cl_tap"] = (SESSION_KEY, ["postgres", "sqlite"])
+_said = asyncio.run(live._resolve_clarify("cl:cl_tap:1", "default"))
+check("a tapped choice resolves the clarify it was asked on", _said == "2. sqlite", repr(_said))
+check("and the question stops waiting", _clarify_gateway.get_pending_for_session(SESSION_KEY) is None)
+check("a tap that arrives too late says so rather than deciding anything",
+      asyncio.run(live._resolve_clarify("cl:cl_tap:1", "default")) == "", "a stale tap resolved something")
+check("and an approval decision is not treated as something the reader said",
+      asyncio.run(live._resolve_approval("appr:nope:once", "default")) == "", "a stale approval resolved something")
 check("and the choices the reader picks from", clarify["json"]["choices"] == ["postgres", "sqlite"], str(clarify["json"].get("choices")))
 check("under the prefix every adapter shares", clarify["json"]["callbackPrefix"] == "cl", str(clarify["json"].get("callbackPrefix")))
 check("an ask says it too, so a quiet instance is still identifiable", clarify["json"]["pluginVersion"] == manifest_version, str(clarify["json"].get("pluginVersion")))

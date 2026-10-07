@@ -120,6 +120,10 @@ RECONNECT_MAX_S = 30.0
 #: fallback spells these as commands (``/approve``, ``/cancel``); this is the same answer without relying on a
 #: message that is not a message becoming one.
 CONFIRM_PREFIX = "cf:"
+#: A tapped choice on a clarify question: ``cl:<clarify id>:<index>``.
+CLARIFY_PREFIX = "cl:"
+#: A decision on an approval: ``appr:<request id>:<choice>``.
+APPROVAL_PREFIX = "appr:"
 
 #: Loopback-only: what this machine answers when somebody asks it what code it is showing.
 PAIR_PATH = "/familiar/pair"
@@ -562,6 +566,10 @@ class FamiliarAdapter(BasePlatformAdapter):
 		# where to say so. The pending hold itself lives in the gateway (``tools.slash_confirm``), so this is
 		# only the address of the answer.
 		self._confirms: Dict[str, Any] = {}
+		#: What a clarify asked, by its id, so a tap can be read back as the choice it picked.
+		self._clarifies: Dict[str, Any] = {}
+		#: Which conversation an approval was asked in, by its id: resolving one needs the session it belongs to.
+		self._approvals: Dict[str, str] = {}
 		# chat key -> the directory this conversation works in. Kept in the process as well as applied, so every
 		# later turn of the conversation gets it even though only the ACT of choosing comes through the ingress.
 		self._directories: Dict[str, str] = {}
@@ -1564,6 +1572,29 @@ class FamiliarAdapter(BasePlatformAdapter):
 
 			return web.json_response({"ok": True})
 
+		# A tapped choice on a clarify question. Resolved here for a reason that is not stylistic: the gateway
+		# resolves a TYPED reply only when it is a number or one of the labels, and reads anything else as prose -
+		# so a callback id handed over as text leaves the agent parked AND lands in the conversation as the
+		# reader's own words. The tap is answered as the choice it is, and the conversation is told the choice in
+		# its own words, so a turn reads as the answer it was.
+		if text.startswith(CLARIFY_PREFIX):
+			said = await self._resolve_clarify(text, chat_id)
+
+			if not said:
+				return web.json_response({"ok": True})
+
+			text = said
+
+		# A decision on an approval this adapter raised. Same reasoning as a tap on a question: the callback id is
+		# a wire format, and handing it to the gateway as text decides nothing.
+		if text.startswith(APPROVAL_PREFIX):
+			decision = await self._resolve_approval(text, chat_id)
+
+			if not decision:
+				return web.json_response({"ok": True})
+
+			text = decision
+
 		source = self.build_source(
 			chat_id=chat_id,
 			chat_name=str(payload.get("channelName") or chat_id),
@@ -1675,6 +1706,12 @@ class FamiliarAdapter(BasePlatformAdapter):
 		"""
 		if not self._token:
 			return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
+
+		# Remembered before it goes out: the answer comes back as a tap carrying only this id, and what was picked
+		# is the question's to say. Bounded, because a clarify that is never answered is never cleared here.
+		self._clarifies[str(clarify_id)] = (session_key, list(choices or []))
+		while len(self._clarifies) > 32:
+			self._clarifies.pop(next(iter(self._clarifies)))
 
 		payload = _ask_payload(
 			self._instance, chat_id or self._home, "clarify", question, choices, clarify_id, session_key, "cl")
@@ -1880,6 +1917,77 @@ class FamiliarAdapter(BasePlatformAdapter):
 			answer = None
 		await self.send(chat_id, answer or "That confirmation is no longer waiting, so nothing was done.")
 
+	async def _resolve_approval(self, text: str, chat_id: str) -> str:
+		"""Resolve the approval the reader decided, answering with the decision as a word.
+
+		The choice already reads as one - ``once``, ``deny``, or a reason - so what is resolved here is the id: an
+		approval is resolved by its own request id out of the queue for the session it was asked in, which is what
+		this adapter remembered when it carried the request out.
+		"""
+		parts = text.split(":", 2)
+		request_id = parts[1] if len(parts) > 1 else ""
+		choice = parts[2] if len(parts) > 2 else ""
+		session_key = self._approvals.pop(request_id, "")
+
+		if not request_id or not choice or not session_key:
+			await self.send(chat_id, "That approval is no longer waiting, so nothing was decided.")
+
+			return ""
+
+		try:
+			from tools import approval as _approval
+
+			resolved = _approval.resolve_gateway_approval(session_key, choice, request_id=request_id)
+		except Exception as error:  # noqa: BLE001 - a failed resolve is still an answer the reader needs
+			logger.warning("[%s] Could not resolve the approval: %s", self.name, error)
+			resolved = 0
+
+		if not resolved:
+			await self.send(chat_id, "That approval is no longer waiting, so nothing was decided.")
+
+			return ""
+
+		return choice
+
+	async def _resolve_clarify(self, text: str, chat_id: str) -> str:
+		"""Resolve the clarify the reader tapped, and answer with the choice in its own words.
+
+		A tap carries the id the question was asked with and the position picked, because that is the callback
+		every adapter's buttons build. Nothing about it is printable, so the choice is looked up from what this
+		adapter remembered asking, resolved through the gateway's own tool, and said in the conversation as the
+		words of the choice - which is what makes the turn read as an answer afterwards.
+
+		Empty when there is nothing left to answer: an answered or expired question is not an error, but the reader
+		still deserves to be told nothing was done.
+		"""
+		parts = text.split(":", 2)
+		clarify_id = parts[1] if len(parts) > 1 else ""
+		picked = parts[2] if len(parts) > 2 else ""
+		remembered = self._clarifies.pop(clarify_id, None)
+		choices = remembered[1] if remembered else []
+		index = int(picked) if picked.isdigit() else -1
+		gone = "That question is no longer waiting, so nothing was answered."
+
+		if not remembered or not 0 <= index < len(choices):
+			await self.send(chat_id, gone)
+
+			return ""
+
+		try:
+			from tools import clarify_gateway as _clarify_gateway
+
+			addressed = _clarify_gateway.resolve_gateway_clarify(clarify_id, choices[index])
+		except Exception as error:  # noqa: BLE001 - a failed resolve is still an answer the reader needs
+			logger.warning("[%s] Could not resolve the clarify: %s", self.name, error)
+			addressed = False
+
+		if not addressed:
+			await self.send(chat_id, gone)
+
+			return ""
+
+		return f"{index + 1}. {choices[index]}"
+
 	async def send_exec_approval(
 		self,
 		chat_id: str,
@@ -1891,6 +1999,11 @@ class FamiliarAdapter(BasePlatformAdapter):
 		"""Carry a command approval to Familiar. Its answer goes to ``resolve_gateway_approval``."""
 		if not self._token:
 			return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
+
+		# Remembered for the same reason a clarify is: the decision comes back carrying only the request id.
+		self._approvals[str(kwargs.get("request_id") or "")] = session_key
+		while len(self._approvals) > 32:
+			self._approvals.pop(next(iter(self._approvals)))
 
 		payload = _ask_payload(
 			self._instance,
