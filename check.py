@@ -1047,6 +1047,8 @@ MID_ID = "20261006_101800_chainmid12"
 TIP_ID = "20261006_101900_chaintip12"
 AFTER_RESET_ID = "20261006_102000_afterreset"
 SOLO_ID = "20261006_102100_solocost12"
+MSG_PARENT_ID = "20261006_102200_msgparent"
+MSG_CHILD_ID = "20261006_102300_msgchild12"
 
 
 def _seed_conversation() -> None:
@@ -1066,6 +1068,16 @@ def _seed_conversation() -> None:
         db.end_session(TIP_ID, "session_reset")
         db.create_session(AFTER_RESET_ID, "familiar", model="deepseek-flash", parent_session_id=TIP_ID)
         db.create_session(SOLO_ID, "familiar", model="deepseek-flash")
+
+        # A pair with something said in each half: the parent's own messages must be its own, and the child's
+        # the child's. Messages go in BEFORE the parent is closed - the store refuses to write to a session that
+        # compression ended, which is the guard that makes this pair the honest case to check.
+        db.create_session(MSG_PARENT_ID, "familiar", model="deepseek-flash")
+        db.append_message(MSG_PARENT_ID, "user", "the first thing said in this conversation")
+        db.append_message(MSG_PARENT_ID, "assistant", "and the answer to it")
+        db.end_session(MSG_PARENT_ID, "compression")
+        db.create_session(MSG_CHILD_ID, "familiar", model="deepseek-flash", parent_session_id=MSG_PARENT_ID)
+        db.append_message(MSG_CHILD_ID, "user", "and the thing said after it was renewed")
 
         usage = {
             ROOT_ID: (5, 100, 0.25),
@@ -1130,6 +1142,43 @@ check(
     "every session of the conversation says when it was last used, the way the reads beside this one do",
     all(row.get("last_active") for row in _from_mid["sessions"]),
     str([row.get("last_active") for row in _from_mid["sessions"]]),
+)
+
+# A session of a conversation answers with its OWN transcript. Opening an old session is how a reader finds where
+# it stopped - which is where they would branch from - and resolving every one of them to the newest session made
+# all of them the same read.
+def _messages_of(session_id: str) -> list:
+    answer = asyncio.run(live._channel_api({
+        "method": "GET", "path": f"/api/sessions/{session_id}/messages?limit=50&order=oldest"}))
+
+    return ((answer.get("body") or {}).get("data") or []), answer.get("status")
+
+_parent_messages, _parent_status = _messages_of(MSG_PARENT_ID)
+check(
+    "the session a conversation was renewed FROM answers with its own messages, not the new one's",
+    _parent_status == 200
+    and len(_parent_messages) == 2
+    and all(str(row.get("session_id")) == MSG_PARENT_ID for row in _parent_messages),
+    str([row.get("session_id") for row in _parent_messages]),
+)
+check(
+    "and it ends where that session ended, which is what a reader branches from",
+    "the answer to it" in str(_parent_messages[-1].get("content")) if _parent_messages else False,
+    str(_parent_messages[-1].get("content"))[:60] if _parent_messages else "-",
+)
+
+_child_messages, _ = _messages_of(MSG_CHILD_ID)
+check(
+    "the session it was renewed INTO answers with its own, too",
+    len(_child_messages) == 1 and all(str(row.get("session_id")) == MSG_CHILD_ID for row in _child_messages),
+    str([row.get("session_id") for row in _child_messages]),
+)
+
+_missing, _missing_status = _messages_of("20261006_102500_emptysession")
+check(
+    "and a session this machine does not have is refused by name",
+    _missing_status == 404,
+    str(_missing_status),
 )
 
 _from_root = _conversations(ROOT_ID)[1][ROOT_ID]

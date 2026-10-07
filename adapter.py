@@ -1217,12 +1217,21 @@ class FamiliarAdapter(BasePlatformAdapter):
 		limit = 500 if default_page else min(requested, 500)
 
 		def work(db: Any) -> Any:
-			if not db.get_session(session_id):
+			held = db.get_session(session_id)
+
+			if not held:
 				return None
 
-			# The id asked about resolves to the session that actually holds the messages: a compression rotates
-			# the session under a conversation without changing the conversation.
-			resolved = db.resolve_resume_session_id(session_id)
+			resolved = session_id
+
+			# A session that holds NOTHING is one compression ended before its messages were flushed: what the
+			# conversation says lives in the session it carried on into, so only that case follows the chain
+			# (Hermes #15000). Every other session answers with its OWN transcript, because a conversation's
+			# sessions are checkpoints: a reader opening one is looking for where it stopped - which is where they
+			# would branch from - and resolving that to the newest session for them made every one of them the
+			# same read.
+			if not held.get("message_count"):
+				resolved = db.resolve_resume_session_id(session_id)
 
 			return (resolved, db.get_messages(resolved, limit=limit, offset=offset, latest=latest_page))
 
