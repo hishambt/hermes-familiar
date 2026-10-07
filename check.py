@@ -1126,10 +1126,12 @@ check(
     str([row["end_reason"] for row in _from_mid["sessions"]]),
 )
 check(
-    "its total adds the chain up, sessions included",
+    "its total sums what each session SPENT, and counts the transcript only where it is",
+    # 100 + 200 + 50 tokens are spent once each and add up. The messages do NOT: a compaction carries the
+    # transcript into the child, so the counts of it belong to the session holding it - the newest.
     _from_mid["total"]["sessions"] == 3
-    and _from_mid["total"]["message_count"] == 13
-    and _from_mid["total"]["input_tokens"] == 350,
+    and _from_mid["total"]["input_tokens"] == 350
+    and _from_mid["total"]["message_count"] == 1,
     str(_from_mid["total"]),
 )
 check(

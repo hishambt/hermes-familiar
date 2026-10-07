@@ -120,7 +120,7 @@ into, so a reader of that list can neither see nor count them. The walk happens 
         { "id": "20261006_101800_chainmid12", "end_reason": "compression", "message_count": 7, "estimated_cost_usd": 0.5, "...": "..." },
         { "id": "20261006_101900_chaintip12", "end_reason": "session_reset", "message_count": 1, "estimated_cost_usd": null, "...": "..." }
       ],
-      "total": { "sessions": 3, "message_count": 13, "input_tokens": 350, "estimated_cost_usd": 0.75 }
+      "total": { "sessions": 3, "message_count": 1, "input_tokens": 350, "estimated_cost_usd": 0.75 }
     }
   }
 }
@@ -130,8 +130,11 @@ into, so a reader of that list can neither see nor count them. The walk happens 
 - A link is only a continuation when the **parent ended by `compression`**. A branch, a reset - which the
   instance's own account calls a separate conversation that merely keeps the pointer - and a subagent run are
   conversations of their own, and their numbers are not this conversation's.
-- `total` adds the chain up. `estimated_cost_usd` is `null` when no session in the chain reported one: a total
-  nobody gave is not zero.
+- `total` sums what each session SPENT - API calls, tokens, cost - because a session's spend is its own.
+  `estimated_cost_usd` is `null` when no session in the chain reported one: a total nobody gave is not zero.
+- `total` does NOT add the chain up for `message_count` and `tool_call_count`. A compaction CARRIES the transcript
+  into its child, so those are the newest session's: the messages are in it, and summing them would count the same
+  messages once per session - a conversation whose live session held 46 messages reported 99.
 - At most 50 ids per call, which is a page of rows in one request. An unknown id answers with no sessions rather
   than a guess.
 

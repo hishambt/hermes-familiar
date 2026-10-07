@@ -313,16 +313,28 @@ CONVERSATION_FIELDS = (
 	"actual_cost_usd",
 )
 
-#: What a conversation's total adds up.
+#: What a conversation's total adds up, session by session.
+#:
+#: These are what each session SPENT, and a session's spend is its own: a compaction copies the transcript into
+#: the child without re-billing a token of it, so calls and tokens are earned once per session and sum.
 CONVERSATION_SUMS = (
-	"message_count",
-	"tool_call_count",
 	"api_call_count",
 	"input_tokens",
 	"output_tokens",
 	"cache_read_tokens",
 	"cache_write_tokens",
 	"reasoning_tokens",
+)
+
+#: What a conversation's total does NOT add up, because a copy of it in a later session is not one more of it.
+#:
+#: A compaction CARRIES the transcript into the child - the messages and the tool calls are in it - so summing
+#: `message_count` over a chain counts the same messages once per session: a two-session conversation whose live
+#: session holds 46 messages reported 99, and the row said 99 while the thread could hold 46. The newest session
+#: is the one that holds the transcript, so its counts are the conversation's.
+CONVERSATION_CARRIED = (
+	"message_count",
+	"tool_call_count",
 )
 
 #: How a parent ended when the conversation carried on in its child. The instance own word for it, and the ONLY
@@ -404,7 +416,9 @@ def _conversation_total(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
 	"""
 	total: Dict[str, Any] = {field: sum(_number(row.get(field)) for row in chain) for field in CONVERSATION_SUMS}
 	reported = [row.get("estimated_cost_usd") for row in chain if row.get("estimated_cost_usd") is not None]
+	carrier = chain[-1] if chain else {}
 
+	total.update({field: _number(carrier.get(field)) for field in CONVERSATION_CARRIED})
 	total["estimated_cost_usd"] = sum(_number(cost) for cost in reported) if reported else None
 	total["sessions"] = len(chain)
 
