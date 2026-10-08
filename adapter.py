@@ -554,6 +554,67 @@ def _job_name(job_id: str) -> Optional[str]:
 		return None
 
 
+#: What a delivery IS, in the words the conversation's own copy records it in. ``message`` is said in the
+#: conversation and is drawn as one; ``notice`` is something that happened TO it - a gateway lifecycle line, a
+#: heartbeat, a job's output - which is kept so the copy stays complete and is never drawn as if a person or the
+#: agent had said it. A command's reply is a lane of its own (`command`), decided on the far side, where the
+#: fact that a command was ASKED lives.
+MESSAGE_KIND = "message"
+NOTICE_KIND = "notice"
+
+#: Hermes' own status wording. This is a floor, not the whole rule: the markers above say it outright whenever
+#: the gateway sets them, and these catch the lanes it does not. Discord keeps the same kind of list for exactly
+#: the same reason (``_DISCORD_NONCONVERSATIONAL_HISTORY_MESSAGE_PATTERNS``, its bridge for gateways older than
+#: its own flag). Anchored at the start and matched on the notice's own wording, never on a leading emoji: an
+#: agent's reply is full of emoji and a rule that read one would swallow the conversation.
+_STATUS_NOTICE_PATTERNS = (
+	re.compile(r"^\s*(?:\u267b\ufe0f|\u26a0\ufe0f)\s*Gateway\s+\S"),
+	re.compile(r"^\s*(?:\u26a1\s*Interrupting|\u21aa\s*Redirected|\u23f3\s*(?:Queued|Subagent working|Compressing context)|\u23e9\s*Steered)"),
+	re.compile(r"^\s*\u23f3\s*Working\s+\u2014\s*\d+\s*min"),
+	re.compile(r"^\s*\u26a0\ufe0f\s*No activity"),
+	re.compile(r"^\s*(?:\U0001f5dc\ufe0f?|\u23f3)?\s*Compressed(?: with fallback)?:\s*\d+"),
+	re.compile(r"^\s*Compression (?:refused|aborted|already in progress|skipped)"),
+	re.compile(r"^\s*No changes from compression"),
+	re.compile(r"^\s*Cronjob Response:"),
+	re.compile(r"^\s*\U0001f7e1\s*/new cancelled"),
+	re.compile(r"^\s*\U0001f4be\s*(?:Self-improvement review:|Skill\s)"),
+	re.compile(r"^\s*\[Background process\s+\S+\s+(?:finished with exit code|is still running~)"),
+	re.compile(r"^\s*[\u2705\u274c]\s*Hermes update\s+(?:finished|failed|timed out)"),
+)
+
+
+def _is_status_notice(content: str) -> bool:
+	"""Whether these words are the gateway reporting on itself rather than speaking in the conversation."""
+	text = content or ""
+
+	return any(pattern.match(text) for pattern in _STATUS_NOTICE_PATTERNS)
+
+
+def _delivery_kind(content: str, metadata: Optional[Dict[str, Any]]) -> str:
+	"""Whether this delivery is said in the conversation, or only happened to it.
+
+	The fact travels WITH the delivery so the far end never has to read the words to tell the two apart: a copy
+	that mixes them cannot be un-mixed downstream, and a reader who asked for the conversation would be shown
+	machine events where it should be.
+
+	Three markers say it outright, on Hermes' side of the wire:
+
+	- ``job_id`` is a cron delivery, so a job's output and never a turn.
+	- ``_interim_send`` is a mid-turn status send (``gateway.run._interim_metadata``), which is by definition not
+	  the turn's final answer. A ``send_message`` call carries neither, so a reply the agent PUSHED into a
+	  conversation - the case this lane exists for - stays a message.
+	- ``non_conversational`` is the gateway's own flag for a lifecycle/status send. It is set for Discord alone
+	  today (``gateway.run._non_conversational_metadata`` returns the metadata untouched for every other
+	  platform, because the flag belongs to Discord's channel-history backfill), so it is read when it is there
+	  and the wording list below is the floor until it is not. When that gate is lifted, the list deletes and
+	  nothing else moves.
+	"""
+	markers = metadata or {}
+	if markers.get("job_id") or markers.get("_interim_send") or markers.get("non_conversational"):
+		return NOTICE_KIND
+
+	return NOTICE_KIND if _is_status_notice(content) else MESSAGE_KIND
+
 def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 	"""What Familiar receives: the notification, not the job.
 
@@ -563,6 +624,9 @@ def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[s
 
 	``jobName`` rides with it because that is what a reader recognizes in a notification list; the id stays for
 	anything that has to act on the job.
+
+	``kind`` says whether this is said in the conversation or only happened to it, which is what keeps a
+	reader's thread to the conversation (see ``_delivery_kind``).
 	"""
 	job_id = (metadata or {}).get("job_id")
 	truncated = len(content) > MAX_MESSAGE_LENGTH
@@ -573,6 +637,7 @@ def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[s
 		"instance": instance,
 		"target": target,
 		"pluginVersion": PLUGIN_VERSION,
+		"kind": _delivery_kind(content, metadata),
 		"content": content[:MAX_MESSAGE_LENGTH],
 		"truncated": truncated,
 		"jobId": str(job_id) if job_id else None,

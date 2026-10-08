@@ -395,10 +395,58 @@ check(
 )
 check("truncated is false for a short brief", payload["truncated"] is False, str(payload))
 check("sentAt is an ISO instant", payload["sentAt"].endswith("+00:00") and "T" in payload["sentAt"], str(payload["sentAt"]))
+# What the delivery IS. The conversation's own copy holds everything the channel carried, so the row says
+# which are said in the conversation and which only happened to it - and the far end never reads the words.
+check(
+	"and the row says it is a job's output, not something said in the conversation",
+	payload["kind"] == "notice",
+	str(payload.get("kind")),
+)
+check(
+	"a job's delivery is a notice, told apart by the job id and not by its words",
+	adapter._delivery_kind("Job output here", {"job_id": JOB_ID}) == "notice",
+	str(adapter._delivery_kind("Job output here", {"job_id": JOB_ID})),
+)
+check(
+	"a mid-turn status send is a notice, which is what _interim_send marks",
+	adapter._delivery_kind("still on it", {"_interim_send": True}) == "notice",
+	str(adapter._delivery_kind("still on it", {"_interim_send": True})),
+)
+check(
+	"the flag is read when the gateway sets it, which is Discord's today",
+	adapter._delivery_kind("anything at all", {"non_conversational": True}) == "notice",
+	str(adapter._delivery_kind("anything at all", {"non_conversational": True})),
+)
+check(
+	"the gateway's own lifecycle line is a notice, and never the conversation",
+	adapter._delivery_kind("♻️ Gateway online — Hermes is back and ready.", None) == "notice",
+	str(adapter._delivery_kind("Gateway online", None)),
+)
+check(
+	"so is the heartbeat, which Hermes words its own way",
+	adapter._delivery_kind("⏳ Working — 3 min — iteration 2/90, clarify", None) == "notice",
+	str(adapter._delivery_kind("Working", None)),
+)
+check(
+	"so is the compression feedback, which opens with its own clamp",
+	adapter._delivery_kind("🗜️ Compressed: 52 → 46 messages", None) == "notice",
+	str(adapter._delivery_kind("Compressed: 52 -> 46", None)),
+)
+check(
+	"and a reply that merely OPENS with an emoji is still the conversation",
+	adapter._delivery_kind("🎉 Done — nothing touched on the server.", None) == "message",
+	str(adapter._delivery_kind("🎉 Done", None)),
+)
+
 
 send(live, chat_id="ops", metadata=None)
 check("an explicit target is used as given", RECEIVED[-1]["json"]["target"] == "ops", str(RECEIVED[-1]["json"]["target"]))
 check("no job means null, not a missing field", RECEIVED[-1]["json"]["jobId"] is None, str(RECEIVED[-1]["json"]))
+check(
+	"a send with no job and no status wording is the conversation itself",
+	RECEIVED[-1]["json"]["kind"] == "message",
+	str(RECEIVED[-1]["json"].get("kind")),
+)
 
 send(adapter.FamiliarAdapter(config(url=URL, token="tok", home_channel="inbox")), chat_id="")
 check(
