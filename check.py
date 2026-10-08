@@ -77,6 +77,7 @@ os.environ["FAMILIAR_TOKEN"] = "tok_abc123"
 os.environ["FAMILIAR_INSTANCE"] = "homelab"
 
 import adapter  # noqa: E402
+import answers  # noqa: E402
 from gateway.config import Platform, PlatformConfig  # noqa: E402
 from gateway.platform_registry import PlatformEntry, platform_registry  # noqa: E402
 
@@ -671,13 +672,13 @@ check(
 # The ceiling is the one place this machine answers "not counted": past it, counting a search means reading more
 # rows than a page is worth, and a number nobody read is worse than no number. Lowered here rather than seeded,
 # because what is being pinned is the ANSWER past the ceiling, not the reading of five thousand rows.
-_ceiling = adapter._SEARCH_COUNT_CEILING
-adapter._SEARCH_COUNT_CEILING = 1
+_ceiling = answers._SEARCH_COUNT_CEILING
+answers._SEARCH_COUNT_CEILING = 1
 try:
     capped = result_of({
         "id": "read-capped", "action": "api", "method": "GET", "path": "/api/sessions?search=e&limit=1"})
 finally:
-    adapter._SEARCH_COUNT_CEILING = _ceiling
+    answers._SEARCH_COUNT_CEILING = _ceiling
 
 capped_body = capped.get("body") or {}
 check(
@@ -1226,7 +1227,7 @@ check(
 _nothing, _ = _read("/familiar/conversation")
 check("a call that asks about nothing is refused, and says which", _nothing == 400, str(_nothing))
 
-_too_many, _ = _read(f"/familiar/conversation?ids={','.join(f's{n}' for n in range(adapter.CONVERSATION_MAX_IDS + 1))}")
+_too_many, _ = _read(f"/familiar/conversation?ids={','.join(f's{n}' for n in range(answers.CONVERSATION_MAX_IDS + 1))}")
 check(
     "and one that asks about more conversations than a page holds",
     _too_many == 400,
