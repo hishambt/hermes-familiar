@@ -1240,6 +1240,46 @@ check(
     str(_unknown_path),
 )
 
+# 6. Unpairing: Familiar lets this machine go. The CREDENTIAL is what disappears, not the address.
+adapter._save_token("tok_paired_here")
+live._take_token("tok_paired_here")
+
+_was = live._url
+_before_unpair = len(RECEIVED)
+asyncio.run(live._answer_request({"id": "unpair-1", "action": "unpair"}, "tok_paired_here"))
+_unpair_posted = RECEIVED[-1] if len(RECEIVED) == _before_unpair + 1 else {}
+
+check(
+    "an unpair is posted back to the reply path, which is what settles the app's request",
+    _unpair_posted.get("path") == "/api/channel/reply",
+    str(_unpair_posted.get("path")),
+)
+check(
+    "and it answers ok, because the app is waiting on that id",
+    ((_unpair_posted.get("json") or {}).get("result") or {}).get("ok") is True,
+    str((_unpair_posted.get("json") or {}).get("result")),
+)
+check(
+    "and the machine FORGETS the token, which is the whole pairing",
+    adapter._load_token() == "" and live._token == "",
+    f"stored={adapter._load_token()!r} held={live._token!r}",
+)
+check(
+    "and keeps the address, so wiring it again is one code and nothing else",
+    live._url == _was,
+    live._url,
+)
+check(
+    "so the channel has nothing to present and takes the PAIRING path again, which is where a reader pairs it",
+    live._presented_token() == "",
+    repr(live._presented_token()),
+)
+check(
+    "and the ingress copy of that credential went with it",
+    live._ingress_token != "tok_paired_here",
+    repr(live._ingress_token),
+)
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")

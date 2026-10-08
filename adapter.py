@@ -991,10 +991,11 @@ class FamiliarAdapter(BasePlatformAdapter):
 	async def _answer_request(self, frame: Dict[str, Any], token: str) -> None:
 		"""Do what Familiar asked down the channel, and answer with the id it came with.
 
-		Three things arrive this way. A SETTING changed in the app goes through the same handler the ingress uses
-		- one implementation, two doors, and no second idea of what setting a model means. A MESSAGE is handed to
-		this machine's own ingress, and a READ is answered from Hermes' own state. An answer is owed either way,
-		because the app is waiting on this id and nothing else will settle it.
+		Four things arrive this way. A MESSAGE is handed to this machine's own ingress, and a READ is answered from
+		Hermes' own state. A SETTING changed in the app goes through the same handler the ingress uses - one
+		implementation, two doors, and no second idea of what setting a model means. And UNPAIRING, which is not a
+		setting on a conversation but this machine's whole relationship with that Familiar: it forgets the token. An
+		answer is owed either way, because the app is waiting on this id and nothing else will settle it.
 		"""
 		request_id = str(frame.get("id") or "")
 		channel = str(frame.get("channel") or self._home)
@@ -1007,6 +1008,10 @@ class FamiliarAdapter(BasePlatformAdapter):
 				# A READ rather than a setting: the app asks a PATH instead of an address, so the answer is
 				# Hermes' own shape of it.
 				result = await self._channel_api(frame)
+			elif action == "unpair":
+				# Answered here rather than through the settings table, because it is not a setting on a
+				# conversation: it is this machine's whole relationship with that Familiar.
+				result = self._unpair()
 			else:
 				known = await self._apply_action(frame, channel)
 				result = {"ok": True} if known else {"error": f"unknown action: {action}"}
@@ -1019,6 +1024,32 @@ class FamiliarAdapter(BasePlatformAdapter):
 				_post, self._url, token, {"id": request_id, "result": result}, CHANNEL_REPLY_PATH)
 		except _DeliveryError as error:
 			logger.warning("[%s] could not answer a channel request: %s", self.name, error)
+
+	def _unpair(self) -> Dict[str, Any]:
+		"""Forget this machine's token, which is what unpairing IS at this end.
+
+		The token is the whole pairing: the connection is authenticated with it, a delivery or an ask carries it, and
+		the ingress refuses without it. Forgotten, the channel loop finds nothing to present on its next turn and goes
+		back to SHOWING A CODE - the state this machine was in before it ever paired, and the state a reader pairs it
+		again from. Nothing else is touched: ``FAMILIAR_URL`` stays, so wiring this machine again is one code and no
+		address at all.
+
+		The copy the ingress was seeded with is dropped with it, unless it was configured deliberately - a value that
+		is not the token being forgotten is somebody's own setting, and it is left alone.
+
+		Synchronous and quiet: nothing here can fail in a way a reader could act on, and an answer is owed either way.
+		"""
+		forgotten = self._token
+
+		_clear_token()
+		self._token = ""
+
+		if forgotten and self._ingress_token == forgotten:
+			self._ingress_token = ""
+
+		logger.info("[familiar] this machine was unpaired from %s; it shows a code again", self._url)
+
+		return {"ok": True, "unpaired": True}
 
 	async def _channel_say(self, frame: Dict[str, Any]) -> Dict[str, Any]:
 		"""Take a message Familiar sent, into this machine's own ingress.
