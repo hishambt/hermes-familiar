@@ -338,8 +338,13 @@ def _conversation_chain(conn: Any, session_id: str) -> List[Dict[str, Any]]:
 	return chain
 
 
-def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, int], visible: int) -> Dict[str, Any]:
-	"""What a conversation reports, given its chain and the two counts the caller took for it."""
+def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, int], visible: Optional[int]) -> Dict[str, Any]:
+	"""What a conversation reports, given its chain and the count the caller took for it.
+
+	``visible`` is None when the caller asked for the conversation WITHOUT its total: the total is a scan of every
+	message the conversation holds, and a reader that does not draw it should not make the store do that. It is then
+	null rather than the newest session's count, which is a SESSION's number and would be read as the conversation's.
+	"""
 	return {
 		# Each entry keeps its OWN numbers, and its own count is the number a reader can SEE in it - the same rule as
 		# everywhere else, asked for the whole chain in one query. A list of sessions draws its rows from these.
@@ -350,11 +355,11 @@ def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, int], visibl
 			}
 			for row in chain
 		],
-		"total": _conversation_total(chain, visible),
+		"total": None if visible is None else _conversation_total(chain, visible),
 	}
 
 
-def _conversations_for(db: Any, ids: List[str]) -> Dict[str, Any]:
+def _conversations_for(db: Any, ids: List[str], totals: bool = True) -> Dict[str, Any]:
 	"""Which conversation each asked session is, and what it adds up to, in the store the caller opened.
 
 	Asked for a page at once rather than row by row, and for the same reason `_visible_counts` is: a page of twenty
@@ -365,6 +370,10 @@ def _conversations_for(db: Any, ids: List[str]) -> Dict[str, Any]:
 	carried it. Hermes counts every ROW, and a `session_meta` row - written when a session starts, holding nothing, one
 	per session - made every conversation read one higher than its thread could ever draw. It goes in the TOTAL and
 	nowhere else: an entry keeps its own session's numbers, because the app draws a row of a list from that entry.
+
+	``totals=False`` answers with the conversations and no totals: the sessions list draws a row's own numbers and never
+	the conversation's total, and every row of a page that does not need it was still paying for a scan of every message
+	the conversation holds.
 	"""
 	conn = getattr(db, "_conn", None)
 
@@ -400,7 +409,9 @@ def _conversations_for(db: Any, ids: List[str]) -> Dict[str, Any]:
 
 		if key not in counted:
 			counted[key] = _conversation_body(
-				chain, each, _conversation_visible(conn, [row["id"] for row in chain])
+				chain,
+				each,
+				_conversation_visible(conn, [row["id"] for row in chain]) if totals else None,
 			)
 
 		found[session_id] = counted[key]
@@ -683,9 +694,15 @@ class FamiliarAnswerRoutes:
 				"body": _api_error(f"at most {CONVERSATION_MAX_IDS} sessions per call", "invalid_request"),
 			}
 
+		# A reader that does not draw the conversation's total says so, and the store is spared the scan: the list this
+		# route mostly serves draws each row's own numbers.
+		totals = (query.get("totals") or ["1"])[0].strip().lower() not in ("0", "false", "no")
+
 		return {
 			"status": 200,
-			"body": {"conversations": await self._with_session_db(lambda db: _conversations_for(db, asked))},
+			"body": {
+				"conversations": await self._with_session_db(lambda db: _conversations_for(db, asked, totals)),
+			},
 		}
 
 
