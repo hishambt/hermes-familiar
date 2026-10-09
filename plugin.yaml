@@ -1,7 +1,7 @@
 name: familiar-platform
 label: Familiar
 kind: platform
-version: 2.9.0
+version: 2.10.0
 description: >
   The channel a Familiar client reaches a Hermes machine through: the machine dials out and holds one
   connection, and messages, asks and reads all travel over it.
