@@ -204,6 +204,33 @@ def _conversation_total(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
 	return total
 
 
+def _visible_messages(conn: Any, session_id: str) -> int:
+	"""How many of a session's rows are messages a reader can see.
+
+	Hermes' own `message_count` counts ROWS, and some rows are bookkeeping rather than anything said: a
+	`session_meta` row is written the moment a session starts, holds nothing at all, and there is exactly one per
+	session - so a conversation read one higher than its thread could ever draw, and the app showed "57 of 57" over
+	56 messages. A hidden row is not something a reader sees either.
+
+	The rule is the app's own (`saysSomething`): words, a tool call, or the model's reasoning. The same predicate in
+	two languages is a risk, so it is written once here and once there, and both names say why - a second idea of
+	what counts as a message is exactly how the two surfaces came to disagree while each looked right alone.
+	"""
+	cursor = conn.execute(
+		"""SELECT count(*) AS visible FROM messages
+		   WHERE session_id = ?
+		     AND coalesce(display_kind, '') <> 'hidden'
+		     AND (trim(coalesce(content, '')) <> ''
+		          OR coalesce(trim(tool_calls), '') NOT IN ('', '[]', 'null')
+		          OR coalesce(reasoning, '') <> ''
+		          OR coalesce(reasoning_content, '') <> '')""",
+		(session_id,),
+	)
+	row = _row_dict(cursor, cursor.fetchone()) or {}
+
+	return int(row.get("visible") or 0)
+
+
 def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 	"""The sessions one conversation is, oldest first, and what they add up to.
 
@@ -258,6 +285,13 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 		current = carried[-1]
 
 	chain.sort(key=lambda row: _number(row.get("started_at")))
+
+	# The count a reader is shown is taken from the rows a reader can SEE rather than from the store's own tally,
+	# and it is taken here because this is where the store is. Hermes counts every row, and a `session_meta` row -
+	# written when a session starts, holding nothing, one per session - made every conversation read one higher than
+	# its thread could ever draw.
+	if chain:
+		chain[-1]["message_count"] = _visible_messages(conn, chain[-1]["id"])
 
 	return {
 		"sessions": [{field: row.get(field) for field in CONVERSATION_FIELDS} for row in chain],

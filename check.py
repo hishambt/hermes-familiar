@@ -1062,13 +1062,21 @@ def _seed_conversation() -> None:
     db = acquire(Path(get_hermes_home()) / "state.db")
     try:
         db.create_session(ROOT_ID, "familiar", model="deepseek-flash")
+        for turn in range(5):
+            db.append_message(ROOT_ID, "user", f"a turn of the conversation's first session ({turn})")
         db.end_session(ROOT_ID, "compression")
         db.create_session(MID_ID, "familiar", model="deepseek-flash", parent_session_id=ROOT_ID)
+        for turn in range(7):
+            db.append_message(MID_ID, "user", f"a turn of the conversation's second session ({turn})")
         db.end_session(MID_ID, "compression")
         db.create_session(TIP_ID, "familiar", model="deepseek-flash", parent_session_id=MID_ID)
+        db.append_message(TIP_ID, "user", "the one message the session holding the transcript holds")
         db.end_session(TIP_ID, "session_reset")
         db.create_session(AFTER_RESET_ID, "familiar", model="deepseek-flash", parent_session_id=TIP_ID)
         db.create_session(SOLO_ID, "familiar", model="deepseek-flash")
+        for turn in range(3):
+            db.append_message(SOLO_ID, "user", f"a turn of a conversation nobody reported a cost for ({turn})")
+
 
         # A pair with something said in each half: the parent's own messages must be its own, and the child's
         # the child's. Messages go in BEFORE the parent is closed - the store refuses to write to a session that
@@ -1079,6 +1087,11 @@ def _seed_conversation() -> None:
         db.end_session(MSG_PARENT_ID, "compression")
         db.create_session(MSG_CHILD_ID, "familiar", model="deepseek-flash", parent_session_id=MSG_PARENT_ID)
         db.append_message(MSG_CHILD_ID, "user", "and the thing said after it was renewed")
+
+        # The two sessions whose counts the assertions below read. A chain's transcript is counted at its TIP and
+        # not at its parents, so the chain's own parents' stored counts stand for themselves alone here.
+        db.append_message(AFTER_RESET_ID, "user", "a conversation of its own, in two messages")
+        db.append_message(AFTER_RESET_ID, "assistant", "and the answer to its own question")
 
         usage = {
             ROOT_ID: (5, 100, 0.25),
@@ -1094,6 +1107,18 @@ def _seed_conversation() -> None:
                 (messages, tokens, cost, session_id),
             )
 
+
+        # And the rows that are NOT messages but that the store's own count includes: a `session_meta` row,
+        # written when a session starts and holding nothing, and one hidden row. This session's `message_count`
+        # now says four while only two of those rows are things a reader can see - the shape of the real
+        # report: a row reading 57 messages over a thread drawing 56.
+        db.append_message(AFTER_RESET_ID, "session_meta", "")
+        db.append_message(AFTER_RESET_ID, "assistant", "")
+        db._conn.execute(
+            "UPDATE messages SET display_kind = 'hidden' WHERE session_id = ? AND role = 'assistant' AND content = ''",
+            (AFTER_RESET_ID,),
+        )
+        db._conn.execute("UPDATE sessions SET message_count = 4 WHERE id = ?", (AFTER_RESET_ID,))
         db._conn.commit()
     finally:
         release_or_close(db)
@@ -1201,6 +1226,15 @@ check(
     "and it counts only itself",
     _after["total"]["sessions"] == 1 and _after["total"]["message_count"] == 2,
     str(_after["total"]),
+)
+
+check(
+    "and what it counts is the messages a reader can SEE, not the rows the store counted",
+    # That session's own `message_count` says 4: two messages, a `session_meta` row holding nothing, and a
+    # hidden row. One `session_meta` row exists per session, which is why every conversation read one higher
+    # than its thread could ever draw - and why the sentence beside a thread read "56 of 57".
+    _after["total"]["message_count"] == 2 and _after["sessions"][0]["message_count"] == 2,
+    f"total={_after['total']['message_count']} session={_after['sessions'][0]['message_count']}",
 )
 
 _solo = _conversations(SOLO_ID)[1][SOLO_ID]
