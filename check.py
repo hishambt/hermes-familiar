@@ -1053,11 +1053,12 @@ MSG_CHILD_ID = "20261006_102300_msgchild12"
 
 
 def _seed_conversation() -> None:
-    """One conversation in three sessions, and a fourth that is NOT part of it.
+    """One conversation in four sessions, linked three ways.
 
-    The link means the same conversation only when the PARENT ended by compressing. The fourth session points at
-    the tip, whose parent ended by reset - which the instance's own account calls a separate conversation - so it
-    must stand on its own.
+    A link is the same conversation when the PARENT ended by compacting OR by a reset: a compaction carries the
+    transcript onto a fresh id, and a reset is the reader's own ``/new``, which starts the next session of the SAME
+    conversation in a topic. The machine's answers from before it are kept per topic and cross it, so counting a
+    reset as a new conversation drew one side of a topic and left the reader's own words behind.
     """
     db = acquire(Path(get_hermes_home()) / "state.db")
     try:
@@ -1143,26 +1144,30 @@ def _conversations(ids: str) -> tuple:
 _from_mid = _conversations(MID_ID)[1][MID_ID]
 check(
     "a session in the middle of a chain answers with the whole conversation, oldest first",
-    [row["id"] for row in _from_mid["sessions"]] == [ROOT_ID, MID_ID, TIP_ID],
+    [row["id"] for row in _from_mid["sessions"]] == [ROOT_ID, MID_ID, TIP_ID, AFTER_RESET_ID],
     str([row["id"] for row in _from_mid["sessions"]]),
 )
 check(
-    "and the row that ends the chain is the one the conversation carried on into",
-    [row["end_reason"] for row in _from_mid["sessions"]] == ["compression", "compression", "session_reset"],
+    "including the session a RESET carried it on into, which is the same conversation",
+    [row["end_reason"] for row in _from_mid["sessions"]] == ["compression", "compression", "session_reset", None],
     str([row["end_reason"] for row in _from_mid["sessions"]]),
 )
 check(
-    "its total sums what each session SPENT, and counts the transcript only where it is",
-    # 100 + 200 + 50 tokens are spent once each and add up. The messages do NOT: a compaction carries the
-    # transcript into the child, so the counts of it belong to the session holding it - the newest.
-    _from_mid["total"]["sessions"] == 3
-    and _from_mid["total"]["input_tokens"] == 350
-    and _from_mid["total"]["message_count"] == 1,
+    "its total sums what each session SPENT, and counts each message once",
+    # 100 + 200 + 50 tokens are spent once each and add up. The messages are counted once for the whole
+    # conversation: 5 + 7 + 1 + 2 are four sessions of one transcript, and none of these rows is a copy of
+    # another, so the number is their sum - and on a store where a compaction HAD copied them, it would be less.
+    # 100 + 200 + 50 + 10 tokens are spent once each and add up. The messages are counted once for the whole
+    # conversation: 5 + 7 + 1 + 2 are four sessions of one transcript, and none of these rows is a copy of
+    # another, so the number is their sum - on a store where a compaction HAD copied them, it would be less.
+    _from_mid["total"]["sessions"] == 4
+    and _from_mid["total"]["input_tokens"] == 360
+    and _from_mid["total"]["message_count"] == 15,
     str(_from_mid["total"]),
 )
 check(
     "and the cost is what the sessions reported, with a session that reported none counted as none",
-    abs(_from_mid["total"]["estimated_cost_usd"] - 0.75) < 1e-9,
+    abs(_from_mid["total"]["estimated_cost_usd"] - 0.77) < 1e-9,
     str(_from_mid["total"]["estimated_cost_usd"]),
 )
 
@@ -1212,19 +1217,19 @@ check(
 _from_root = _conversations(ROOT_ID)[1][ROOT_ID]
 check(
     "asking from the session the conversation STARTED in says the same thing",
-    [row["id"] for row in _from_root["sessions"]] == [ROOT_ID, MID_ID, TIP_ID],
+    [row["id"] for row in _from_root["sessions"]] == [ROOT_ID, MID_ID, TIP_ID, AFTER_RESET_ID],
     str([row["id"] for row in _from_root["sessions"]]),
 )
 
 _after = _conversations(AFTER_RESET_ID)[1][AFTER_RESET_ID]
 check(
-    "a session whose parent was RESET is its own conversation, not a continuation of the chain",
-    [row["id"] for row in _after["sessions"]] == [AFTER_RESET_ID],
+    "a session whose parent was RESET is part of that conversation, not a conversation of its own",
+    [row["id"] for row in _after["sessions"]] == [ROOT_ID, MID_ID, TIP_ID, AFTER_RESET_ID],
     str([row["id"] for row in _after["sessions"]]),
 )
 check(
-    "and it counts only itself",
-    _after["total"]["sessions"] == 1 and _after["total"]["message_count"] == 2,
+    "and the conversation counts what every session of it holds, once",
+    _after["total"]["sessions"] == 4 and _after["total"]["message_count"] == 15,
     str(_after["total"]),
 )
 
@@ -1233,7 +1238,9 @@ check(
     # That session's own `message_count` says 4: two messages, a `session_meta` row holding nothing, and a
     # hidden row. One `session_meta` row exists per session, which is why every conversation read one higher
     # than its thread could ever draw - and why the sentence beside a thread read "56 of 57".
-    _after["total"]["message_count"] == 2 and _after["sessions"][0]["message_count"] == 2,
+    # The conversation's number is the whole of it; each ROW of it still answers for its own session alone,
+    # which is what a list of sessions draws.
+    _after["total"]["message_count"] == 15 and _after["sessions"][0]["message_count"] == 5,
     f"total={_after['total']['message_count']} session={_after['sessions'][0]['message_count']}",
 )
 

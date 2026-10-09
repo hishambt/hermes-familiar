@@ -116,10 +116,14 @@ CONVERSATION_CARRIED = (
 	"tool_call_count",
 )
 
-#: How a parent ended when the conversation carried on in its child. The instance own word for it, and the ONLY
+#: How a parent ended when the conversation carried on in its child. TWO things say that, and the app needs both to
+#: be one conversation: a compaction carries the transcript onto a fresh id, and a reset is the reader's own ``/new``,
+#: which starts the next session of the same conversation in a topic - the machine's answers from before it are kept
+#: per topic and cross it, so counting the reset as a new conversation drew one side of a topic and not the other.
+#: A branch and a subagent run are conversations of their own; the store says which in the same field. The instance own word for it, and the ONLY
 #: link that means the same conversation: the same field carries a branch, a reset (a separate conversation by the
 #: instance own account) and a subagent run, and those are conversations of their own.
-CONTINUATION_END_REASON = "compression"
+CONTINUATION_END_REASONS = ("compression", "session_reset")
 
 #: A conversation is not this long. The walk stops rather than believing the store.
 CONVERSATION_MAX_LINKS = 200
@@ -234,19 +238,38 @@ def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, int]:
 	return found
 
 
-def _visible_messages(conn: Any, session_id: str) -> int:
-	"""How many of a session's rows are messages a reader can see.
+def _conversation_visible(conn: Any, session_ids: List[str]) -> int:
+	"""How many messages a reader can see across a whole conversation, counting each one ONCE.
 
-	Hermes' own `message_count` counts ROWS, and some rows are bookkeeping rather than anything said: a
-	`session_meta` row is written the moment a session starts, holds nothing at all, and there is exactly one per
-	session - so a conversation read one higher than its thread could ever draw, and the app showed "57 of 57" over
-	56 messages. A hidden row is not something a reader sees either.
+	The sessions of one conversation overlap. A compaction COPIES the transcript into its child - measured on a real
+	store: 0 shared row ids and 30 identical (role, content) pairs - so adding the sessions up counts the same message
+	once per session (a five-session topic: 170 rows summed against 129 said). Taking one session alone under counts
+	the other way: the copy is not complete, and what a compaction dropped from the parent exists nowhere else.
 
-	The rule is the app's own (`saysSomething`): words, a tool call, or the model's reasoning. The same predicate in
-	two languages is a risk, so it is written once here and once there, and both names say why - a second idea of
-	what counts as a message is exactly how the two surfaces came to disagree while each looked right alone.
+	What tells a copy from its original is the row's own ``display_identity``, and it survives the copy byte for byte.
+	When a row has none - nothing in the store measured did, but a store can be older than the column - its own id
+	stands in, which only ever matches itself.
 	"""
-	return _visible_counts(conn, [session_id]).get(session_id, 0)
+	if not session_ids:
+		return 0
+
+	marks = ", ".join("?" for _ in session_ids)
+	cursor = conn.execute(
+		f"""SELECT count(*) AS visible FROM (
+		        SELECT coalesce(nullif(hex(display_identity), ''), 'id:' || id) AS one
+		        FROM messages
+		        WHERE session_id IN ({marks})
+		          AND coalesce(display_kind, '') <> 'hidden'
+		          AND (trim(coalesce(content, '')) <> ''
+		               OR coalesce(trim(tool_calls), '') NOT IN ('', '[]', 'null')
+		               OR coalesce(reasoning, '') <> ''
+		               OR coalesce(reasoning_content, '') <> '')
+		        GROUP BY one)""",
+		tuple(session_ids),
+	)
+	held = _row_dict(cursor, cursor.fetchone()) or {}
+
+	return int(held.get("visible") or 0)
 
 
 def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
@@ -275,7 +298,7 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 
 		parent = _one(conn, f"{_session_select()} WHERE s.id = ?", (parent_id,))
 
-		if parent is None or parent.get("end_reason") != CONTINUATION_END_REASON:
+		if parent is None or parent.get("end_reason") not in CONTINUATION_END_REASONS:
 			break
 
 		seen.add(parent["id"])
@@ -286,7 +309,7 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 	current = start
 
 	for _ in range(CONVERSATION_MAX_LINKS):
-		if current.get("end_reason") != CONTINUATION_END_REASON:
+		if current.get("end_reason") not in CONTINUATION_END_REASONS:
 			break
 
 		carried = [child for child in _children(conn, current["id"]) if child["id"] not in seen]
@@ -304,12 +327,12 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 
 	chain.sort(key=lambda row: _number(row.get("started_at")))
 
-	# The count a reader is shown is taken from the rows a reader can SEE rather than from the store's own tally,
-	# and it is taken here because this is where the store is. Hermes counts every row, and a `session_meta` row -
-	# written when a session starts, holding nothing, one per session - made every conversation read one higher than
-	# its thread could ever draw.
+	# The count a reader is shown is taken from the rows a reader can SEE, counting each message once however many
+	# sessions carried it, and it is taken here because this is where the store is. Hermes counts every ROW, and a
+	# `session_meta` row - written when a session starts, holding nothing, one per session - made every conversation
+	# read one higher than its thread could ever draw.
 	if chain:
-		chain[-1]["message_count"] = _visible_messages(conn, chain[-1]["id"])
+		chain[-1]["message_count"] = _conversation_visible(conn, [row["id"] for row in chain])
 
 	return {
 		"sessions": [{field: row.get(field) for field in CONVERSATION_FIELDS} for row in chain],
@@ -409,7 +432,17 @@ def _message_payload(message: Dict[str, Any]) -> Dict[str, Any]:
 		"timestamp", "token_count", "finish_reason", "reasoning", "reasoning_content",
 		"display_kind")
 
-	return {key: projected.get(key) for key in safe_keys if key in projected}
+	payload = {key: projected.get(key) for key in safe_keys if key in projected}
+
+	# The row's own identity, as hex. A compaction copies a transcript into its child and the copy keeps the identity
+	# the message had, which is what lets a reader of two sessions draw each message once - so it crosses the wire.
+	# The store keeps it as a BLOB, and JSON has no bytes.
+	identity = projected.get("display_identity")
+
+	if identity is not None:
+		payload["identity"] = bytes(identity).hex() if isinstance(identity, (bytes, bytearray, memoryview)) else str(identity)
+
+	return payload
 
 
 class FamiliarAnswerRoutes:
