@@ -1297,7 +1297,36 @@ check(
     str(_unknown_path),
 )
 
-# 6. Unpairing: Familiar lets this machine go. The CREDENTIAL is what disappears, not the address.
+# 6. A delivery says whether it was SAID in the conversation or only happened TO it, so the far end can draw a
+# notice as a notice rather than as something a person or the agent said. The markers are Hermes' own; the wording is
+# the floor for the lanes it does not mark.
+check(
+    "a cron delivery carries the job, so it is a notice and not something said",
+    adapter._delivery_kind("Anything at all", {"job_id": "abc"}) == adapter.NOTICE_KIND,
+    adapter._delivery_kind("Anything at all", {"job_id": "abc"}),
+)
+check(
+    "a mid-turn status send is a notice, by definition not the turn's answer",
+    adapter._delivery_kind("Still working on it", {"_interim_send": True}) == adapter.NOTICE_KIND,
+    adapter._delivery_kind("Still working on it", {"_interim_send": True}),
+)
+check(
+    "the gateway's own line is a notice even with no marker on it",
+    adapter._delivery_kind("\u267b\ufe0f Gateway online", None) == adapter.NOTICE_KIND,
+    adapter._delivery_kind("\u267b\ufe0f Gateway online", None),
+)
+check(
+    "and what the agent PUSHED into the conversation is a message, which is the lane's whole point",
+    adapter._delivery_kind("Here is the summary you asked for \U0001f31f", None) == adapter.MESSAGE_KIND,
+    adapter._delivery_kind("Here is the summary you asked for \U0001f31f", None),
+)
+check(
+    "a reply that happens to start with an emoji is not mistaken for a status line",
+    adapter._delivery_kind("\u2705 All done - three files changed", None) == adapter.MESSAGE_KIND,
+    adapter._delivery_kind("\u2705 All done - three files changed", None),
+)
+
+# 7. Unpairing: Familiar lets this machine go. The CREDENTIAL is what disappears, not the address.
 adapter._save_token("tok_paired_here")
 live._take_token("tok_paired_here")
 
