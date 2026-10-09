@@ -302,6 +302,26 @@ def _instance_name(extra: Dict[str, Any]) -> str:
 #: that a command was ASKED lives.
 MESSAGE_KIND = "message"
 NOTICE_KIND = "notice"
+REPLY_KIND = "reply"
+# The turn's own final answer. Set by this plugin rather than by Hermes: see `_turn_final_metadata`.
+TURN_FINAL_FLAG = "_turn_final"
+
+
+def _turn_final_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+	"""Mark the turn's OWN final answer, so the far end does not keep a second copy of it.
+
+	A session holds a turn's answer already. Familiar keeps what a session does NOT hold - the gateway's own notices, a
+	command's answer, a job's output - and reads the rest of the conversation back from the instance, so the answer is
+	the one delivery it is told not to store.
+
+	Deliberately not inferred from the words at the far end, and not asked of Hermes either: the base adapter brackets
+	every final text through ``send_final_ledgered`` (the normal lane and the queued lane both), and that is where the
+	fact is attached. An older Hermes without that bracket never calls it, so the delivery arrives unmarked and the far
+	end KEEPS it - a duplicate rather than a lost message, which is the only direction this may fail in.
+	"""
+	merged = dict(metadata or {})
+	merged[TURN_FINAL_FLAG] = True
+	return merged
 
 #: Hermes' own status wording. This is a floor, not the whole rule: the markers above say it outright whenever the
 #: gateway sets them, and these catch the lanes it does not. Discord keeps the same kind of list for exactly the
@@ -337,8 +357,11 @@ def _delivery_kind(content: str, metadata: Optional[Dict[str, Any]]) -> str:
 	events where its own words should be. A thread draws the two differently, and the count a reader is shown is about
 	the conversation alone.
 
-	Three markers say it outright, on Hermes' side of the wire:
+	Four markers say it outright:
 
+	- ``_turn_final`` is the turn's own final answer, which the SESSION already holds. It is the one delivery the far
+	  end is told not to keep, because it reads a conversation back from the instance and keeps only what a session
+	  does not hold. Set by this plugin at the bracket every final text goes through (see ``_turn_final_metadata``).
 	- ``job_id`` is a cron delivery, so a job's output and never a turn.
 	- ``_interim_send`` is a mid-turn status send, which by definition is not the turn's final answer. A
 	  ``send_message`` call carries neither, so a reply the agent PUSHED into a conversation - the case this lane
@@ -347,6 +370,9 @@ def _delivery_kind(content: str, metadata: Optional[Dict[str, Any]]) -> str:
 	  when it is there, and the wording list is the floor until it is not.
 	"""
 	markers = metadata or {}
+
+	if markers.get(TURN_FINAL_FLAG):
+		return REPLY_KIND
 
 	if markers.get("job_id") or markers.get("_interim_send") or markers.get("non_conversational"):
 		return NOTICE_KIND
@@ -855,6 +881,30 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		self._mark_disconnected()
 
 	# -- Outbound ------------------------------------------------------------
+
+	async def send_final_ledgered(
+		self,
+		event: MessageEvent,
+		session_key: str,
+		text_content: str,
+		metadata: Optional[Dict[str, Any]],
+		*,
+		reply_to: Optional[str],
+		is_ephemeral_response: bool = False,
+	):
+		"""The turn's final answer, marked as one: see ``_turn_final_metadata``.
+
+		Hermes brackets every final text through here - the normal lane and the queued lane both - so this is the one
+		place the fact can be attached without guessing at the words from the other end of the wire.
+		"""
+		return await super().send_final_ledgered(
+			event,
+			session_key,
+			text_content,
+			_turn_final_metadata(metadata),
+			reply_to=reply_to,
+			is_ephemeral_response=is_ephemeral_response,
+		)
 
 	async def send(
 		self,
