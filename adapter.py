@@ -1037,12 +1037,21 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 			return web.json_response({"ok": True})
 
+		# Authorized by ROLE, not by a user id, and this is the whole reason a Familiar command is not answered with
+		# a pairing code: this message reached the ingress down the channel THIS machine opened, authenticated by the
+		# instance token - a token that exists because the owner paired Familiar with this machine in the first place.
+		# Asking Hermes for a second pairing would be asking the owner to vouch for themselves twice.
+		#
+		# And the failure was worse than a nuisance: the first unauthorized message is answered with a code, and every
+		# one after it inside the rate-limit window is DROPPED SILENTLY (`run_inbound.py`), which is why `/status` came
+		# back with a pairing prompt while `/context` and `/compress` never answered at all.
 		source = self.build_source(
 			chat_id=chat_id,
 			chat_name=str(payload.get("channelName") or chat_id),
 			chat_type="dm",
 			user_id=str(payload.get("userId") or "familiar"),
 			user_name=str(payload.get("userName") or "Familiar"),
+			role_authorized=True,
 		)
 		event = MessageEvent(
 			text=text,
