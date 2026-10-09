@@ -1223,6 +1223,11 @@ check(
 
 _after = _conversations(AFTER_RESET_ID)[1][AFTER_RESET_ID]
 check(
+    "and every session of it still answers for ITSELF, which is what a list of sessions draws",
+    [row["message_count"] for row in _from_mid["sessions"]] == [5, 7, 1, 2],
+    str([row["message_count"] for row in _from_mid["sessions"]]),
+)
+check(
     "a session whose parent was RESET is part of that conversation, not a conversation of its own",
     [row["id"] for row in _after["sessions"]] == [ROOT_ID, MID_ID, TIP_ID, AFTER_RESET_ID],
     str([row["id"] for row in _after["sessions"]]),

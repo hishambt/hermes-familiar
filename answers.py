@@ -107,14 +107,14 @@ CONVERSATION_SUMS = (
 
 #: What a conversation's total does NOT add up, because a copy of it in a later session is not one more of it.
 #:
-#: A compaction CARRIES the transcript into the child - the messages and the tool calls are in it - so summing
-#: `message_count` over a chain counts the same messages once per session: a two-session conversation whose live
-#: session holds 46 messages reported 99, and the row said 99 while the thread could hold 46. The newest session
-#: is the one that holds the transcript, so its counts are the conversation's.
-CONVERSATION_CARRIED = (
-	"message_count",
-	"tool_call_count",
-)
+#: What a conversation takes from the session holding its transcript rather than adding up: a compaction CARRIES the
+#: tool calls into the child, so summing them over a chain counts them once per session.
+#:
+#: The MESSAGE count is not here any more, and must not come back. It is counted once across the whole chain
+#: (`_conversation_visible`) and belongs to the conversation's total alone - a session's entry keeps its OWN count,
+#: because a list of sessions draws its rows from those entries. Writing the conversation's number into the newest
+#: entry put a whole conversation's messages on one session's row, which the History table read.
+CONVERSATION_CARRIED = ("tool_call_count",)
 
 #: How a parent ended when the conversation carried on in its child. TWO things say that, and the app needs both to
 #: be one conversation: a compaction carries the transcript onto a fresh id, and a reset is the reader's own ``/new``,
@@ -191,17 +191,22 @@ def _children(conn: Any, session_id: str) -> List[Dict[str, Any]]:
 	return [row for row in (_with_recency(_row_dict(cursor, row)) for row in cursor.fetchall()) if row]
 
 
-def _conversation_total(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _conversation_total(chain: List[Dict[str, Any]], visible: Optional[int] = None) -> Dict[str, Any]:
 	"""What the sessions of one conversation add up to.
 
 	`estimated_cost_usd` stays null when no session in the chain reported one: a total nobody gave is not zero,
 	and the app decides what to draw from that.
+
+	`visible` is the conversation's own message count, counted once across the chain by `_conversation_visible`. It is
+	passed in rather than read off the newest session's entry, because those entries are a SESSION's numbers and are
+	drawn as such: a row in a list of sessions must answer for that session, not for its whole lineage.
 	"""
 	total: Dict[str, Any] = {field: sum(_number(row.get(field)) for row in chain) for field in CONVERSATION_SUMS}
 	reported = [row.get("estimated_cost_usd") for row in chain if row.get("estimated_cost_usd") is not None]
 	carrier = chain[-1] if chain else {}
 
 	total.update({field: _number(carrier.get(field)) for field in CONVERSATION_CARRIED})
+	total["message_count"] = visible if visible is not None else _number(carrier.get("message_count"))
 	total["estimated_cost_usd"] = sum(_number(cost) for cost in reported) if reported else None
 	total["sessions"] = len(chain)
 
@@ -331,12 +336,23 @@ def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
 	# sessions carried it, and it is taken here because this is where the store is. Hermes counts every ROW, and a
 	# `session_meta` row - written when a session starts, holding nothing, one per session - made every conversation
 	# read one higher than its thread could ever draw.
-	if chain:
-		chain[-1]["message_count"] = _conversation_visible(conn, [row["id"] for row in chain])
+	#
+	# It goes in the TOTAL and nowhere else: the entries below stay each session's OWN numbers, because the app draws a
+	# row of a sessions list from the entry for that session.
+	each = _visible_counts(conn, [row["id"] for row in chain]) if chain else {}
+	visible = _conversation_visible(conn, [row["id"] for row in chain]) if chain else 0
 
 	return {
-		"sessions": [{field: row.get(field) for field in CONVERSATION_FIELDS} for row in chain],
-		"total": _conversation_total(chain),
+		# Each entry keeps its OWN numbers, and its own count is the number a reader can SEE in it - the same rule as
+		# everywhere else, asked here for the whole chain in one query. A list of sessions draws its rows from these.
+		"sessions": [
+			{
+				**{field: row.get(field) for field in CONVERSATION_FIELDS},
+				"message_count": each.get(str(row.get("id")), row.get("message_count")),
+			}
+			for row in chain
+		],
+		"total": _conversation_total(chain, visible),
 	}
 
 
