@@ -1237,6 +1237,16 @@ check(
     f"total={_after['total']['message_count']} session={_after['sessions'][0]['message_count']}",
 )
 
+# The SAME number on the session itself, because a thread opened from HISTORY has no topic and reads that
+# one - which is what left its header saying "53 of 54" over 53 messages while the row said 53.
+_bookkept = result_of({"id": "read-bookkept", "action": "api", "method": "GET", "path": f"/api/sessions/{AFTER_RESET_ID}"})
+_bookkept_session = (_bookkept.get("body") or {}).get("session") or {}
+check(
+    "and a session's own count is the messages a reader can see, not the rows the store counted",
+    _bookkept_session.get("message_count") == 2,
+    f"message_count={_bookkept_session.get('message_count')} (the store's own says 4)",
+)
+
 _solo = _conversations(SOLO_ID)[1][SOLO_ID]
 check(
     "a conversation where nobody reported a cost reports NO cost, because a total nobody gave is not zero",

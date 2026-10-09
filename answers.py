@@ -204,6 +204,36 @@ def _conversation_total(chain: List[Dict[str, Any]]) -> Dict[str, Any]:
 	return total
 
 
+def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, int]:
+	"""How many messages each of these sessions holds that a reader can see, in ONE query.
+
+	The rule below is the app's own (`saysSomething`). It is asked for a page of sessions at once because the
+	sessions list answers up to two hundred of them, and a count per row would be a query per row.
+	"""
+	if not session_ids:
+		return {}
+
+	marks = ", ".join("?" for _ in session_ids)
+	cursor = conn.execute(
+		f"""SELECT session_id, count(*) AS visible FROM messages
+		    WHERE session_id IN ({marks})
+		      AND coalesce(display_kind, '') <> 'hidden'
+		      AND (trim(coalesce(content, '')) <> ''
+		           OR coalesce(trim(tool_calls), '') NOT IN ('', '[]', 'null')
+		           OR coalesce(reasoning, '') <> ''
+		           OR coalesce(reasoning_content, '') <> '')
+		    GROUP BY session_id""",
+		tuple(session_ids),
+	)
+	found: Dict[str, int] = {}
+
+	for row in cursor.fetchall():
+		held = _row_dict(cursor, row) or {}
+		found[str(held.get("session_id"))] = int(held.get("visible") or 0)
+
+	return found
+
+
 def _visible_messages(conn: Any, session_id: str) -> int:
 	"""How many of a session's rows are messages a reader can see.
 
@@ -216,19 +246,7 @@ def _visible_messages(conn: Any, session_id: str) -> int:
 	two languages is a risk, so it is written once here and once there, and both names say why - a second idea of
 	what counts as a message is exactly how the two surfaces came to disagree while each looked right alone.
 	"""
-	cursor = conn.execute(
-		"""SELECT count(*) AS visible FROM messages
-		   WHERE session_id = ?
-		     AND coalesce(display_kind, '') <> 'hidden'
-		     AND (trim(coalesce(content, '')) <> ''
-		          OR coalesce(trim(tool_calls), '') NOT IN ('', '[]', 'null')
-		          OR coalesce(reasoning, '') <> ''
-		          OR coalesce(reasoning_content, '') <> '')""",
-		(session_id,),
-	)
-	row = _row_dict(cursor, cursor.fetchone()) or {}
-
-	return int(row.get("visible") or 0)
+	return _visible_counts(conn, [session_id]).get(session_id, 0)
 
 
 def _conversation(conn: Any, session_id: str) -> Dict[str, Any]:
@@ -340,12 +358,17 @@ def _api_error(message: str, code: str) -> Dict[str, Any]:
 	return {"error": {"message": message, "type": "invalid_request_error", "param": None, "code": code}}
 
 
-def _session_payload(session: Dict[str, Any]) -> Dict[str, Any]:
+def _session_payload(session: Dict[str, Any], visible: Optional[int] = None) -> Dict[str, Any]:
 	"""One session, in the shape the instance's API answers with.
 
 	The fields are the API server's own client-safe list (``api_server.py::_session_response``): a full system
 	prompt or model config never crosses a client surface, only whether one is there. Copied deliberately and kept
 	identical, because the app parses that shape and a second one would drift from it.
+
+	ONE deviation, and it is the number rather than the shape: ``visible`` replaces ``message_count`` with what
+	``_visible_counts`` read from the store. The app draws a session's transcript and puts that count beside it, so a
+	row of bookkeeping the store counts - a ``session_meta`` row, which holds nothing and exists once per session -
+	left the header saying "53 of 54" over 53 messages. The shape stays the API's; the count is the reader's.
 	"""
 	safe_keys = (
 		"id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
@@ -358,6 +381,9 @@ def _session_payload(session: Dict[str, Any]) -> Dict[str, Any]:
 	payload.update({flag: bool(payload[flag]) for flag in ("pinned", "archived", "hidden") if flag in payload})
 	payload["has_system_prompt"] = bool(session.get("system_prompt"))
 	payload["has_model_config"] = bool(session.get("model_config"))
+
+	if visible is not None:
+		payload["message_count"] = visible
 
 	return payload
 
@@ -624,14 +650,29 @@ class FamiliarAnswerRoutes:
 			else:
 				total = db.session_count(source=source, exclude_children=not include_children)
 
-			return {"sessions": sessions, "has_more": has_more, "total": total}
+			return {
+				"sessions": sessions,
+				"has_more": has_more,
+				"total": total,
+				# One query for the page rather than one per row: see _visible_counts.
+				"visible": _visible_counts(
+					getattr(db, "_conn", None),
+					[session["id"] for session in sessions if session.get("id")],
+				),
+			}
 
 		page = await self._with_session_db(read)
 
 		return {"status": 200, "body": {
-			"object": "list", "data": [_session_payload(session) for session in page["sessions"]],
+			"object": "list",
+			"data": [_session_payload(session, page["visible"].get(session.get("id"))) for session in page["sessions"]],
 			"limit": limit, "offset": offset, "has_more": page["has_more"], "total": page["total"]}}
 
+
+	async def _visible_for(self, session_id: str) -> Dict[str, int]:
+		"""The visible count for one session, read from the store off the loop."""
+		return await self._with_session_db(
+			lambda db: _visible_counts(getattr(db, "_conn", None), [session_id]))
 
 	async def _api_get_session(
 			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
@@ -641,7 +682,10 @@ class FamiliarAnswerRoutes:
 		if not session:
 			return self._no_such_session(groups["session"])
 
-		return {"status": 200, "body": {"object": "hermes.session", "session": _session_payload(session)}}
+		visible = (await self._visible_for(groups["session"])).get(groups["session"])
+
+		return {"status": 200, "body": {
+			"object": "hermes.session", "session": _session_payload(session, visible)}}
 
 
 	async def _api_session_messages(
@@ -752,7 +796,10 @@ class FamiliarAnswerRoutes:
 		if session is None:
 			return self._no_such_session(session_id)
 
-		return {"status": 200, "body": {"object": "hermes.session", "session": _session_payload(session)}}
+		visible = (await self._visible_for(session_id)).get(session_id)
+
+		return {"status": 200, "body": {
+			"object": "hermes.session", "session": _session_payload(session, visible)}}
 
 
 	def _cron(self) -> Dict[str, Any]:
@@ -848,7 +895,10 @@ class FamiliarAnswerRoutes:
 		if forked == "exists":
 			return {"status": 409, "body": _api_error("Session already exists", "session_exists")}
 
-		return {"status": 201, "body": {"object": "hermes.session", "session": _session_payload(forked)}}
+		visible = (await self._visible_for(str(forked.get("id") or ""))).get(str(forked.get("id") or ""))
+
+		return {"status": 201, "body": {
+			"object": "hermes.session", "session": _session_payload(forked, visible)}}
 
 
 	async def _api_delete_session(
