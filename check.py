@@ -1114,8 +1114,16 @@ def _seed_conversation() -> None:
         # now says four while only two of those rows are things a reader can see - the shape of the real
         # report: a row reading 57 messages over a thread drawing 56.
         db.append_message(AFTER_RESET_ID, "session_meta", "")
-        # And a NOTICE: a row a reader can SEE, which is drawn as a notice rather than counted as something said.
-        # The count a reader is shown is about the conversation alone, so this one must not move `message_count`.
+        # And a NOTICE: the store MARKS it, and that mark is what a thread draws as a notice. The count a reader is
+        # shown is about the conversation alone, so it must not move `message_count`.
+        db.append_message(AFTER_RESET_ID, "assistant", "Gateway restarting - your current task will resume.")
+        db._conn.execute(
+            "UPDATE messages SET display_kind = 'internal_notification' WHERE session_id = ? AND display_kind IS NULL "
+            "AND content LIKE 'Gateway restarting%'",
+            (AFTER_RESET_ID,),
+        )
+        # And a row of the machine's own status WORDING, which is neither a message nor a notice: a thread draws a
+        # compaction handoff as what it is, so it must move NEITHER number.
         db.append_message(AFTER_RESET_ID, "assistant", "[PRIOR CONTEXT \u2014 for reference only; not a new message]")
         db.append_message(AFTER_RESET_ID, "assistant", "")
         db._conn.execute(

@@ -235,10 +235,10 @@ def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, Dict[str, in
 	"""How many MESSAGES and how many NOTICES each of these sessions holds, in ONE query.
 
 	The rule below is the app's own (``saysSomething``): a row a reader can see, and never a ``hidden`` one - the
-	bookkeeping the store writes once per session. It is then parted the way a thread DRAWS it, because the count a
-	reader is shown is about the conversation alone: ``adapter._delivery_kind`` already says a notice is something
-	that happened to a conversation rather than something said in it, and counting one as a message is what made a
-	count disagree with the transcript under it.
+	bookkeeping the store writes once per session. It is then parted the way a thread DRAWS it: a row the store marks
+	``internal_notification`` is drawn as a notice, and the machine's own status wording (``_is_status_notice``) is
+	neither - it is drawn as the compaction handoff or the status line it is, so it is not counted as something said.
+	Measured on a topic whose thread drew 7 notices: counting every floor match as a notice made the header say 11.
 
 	The rows' own words come back rather than a count of them, because telling a notice from a message is a list of
 	regular expressions and SQLite has none. Still ONE query per page - the sessions list answers up to two hundred
@@ -251,7 +251,8 @@ def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, Dict[str, in
 
 	marks = ", ".join("?" for _ in session_ids)
 	cursor = conn.execute(
-		f"""SELECT session_id, coalesce(substr(content, 1, 200), '') AS head FROM messages
+		f"""SELECT session_id, coalesce(display_kind, '') AS marked, coalesce(substr(content, 1, 200), '') AS head
+		    FROM messages
 		    WHERE session_id IN ({marks})
 		      AND coalesce(display_kind, '') <> 'hidden'
 		      AND (trim(coalesce(content, '')) <> ''
@@ -266,9 +267,12 @@ def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, Dict[str, in
 		held = _row_dict(cursor, row) or {}
 		counted = found.setdefault(str(held.get("session_id")), {"messages": 0, "notices": 0})
 
-		if _is_status_notice(str(held.get("head") or "")):
+		if str(held.get("marked") or "") == "internal_notification":
+			# The store's own mark, and the only rows a thread draws AS a notice - the bordered note rather than a
+			# bubble. The wording floor below is a different question: it catches what the machine SAID, which is
+			# drawn as the compaction handoff or status line it is.
 			counted["notices"] += 1
-		else:
+		elif not _is_status_notice(str(held.get("head") or "")):
 			counted["messages"] += 1
 
 	return found
@@ -292,6 +296,7 @@ def _conversation_visible(conn: Any, session_ids: List[str]) -> Dict[str, int]:
 	marks = ", ".join("?" for _ in session_ids)
 	cursor = conn.execute(
 		f"""SELECT coalesce(nullif(hex(display_identity), ''), 'id:' || id) AS one,
+		           max(coalesce(display_kind, '')) AS marked,
 		           coalesce(substr(min(content), 1, 200), '') AS head
 		    FROM messages
 		    WHERE session_id IN ({marks})
@@ -309,7 +314,10 @@ def _conversation_visible(conn: Any, session_ids: List[str]) -> Dict[str, int]:
 	# classified the same on either side of the compaction that copied it.
 	for row in cursor.fetchall():
 		held = _row_dict(cursor, row) or {}
-		counts["notices" if _is_status_notice(str(held.get("head") or "")) else "messages"] += 1
+		if str(held.get("marked") or "") == "internal_notification":
+			counts["notices"] += 1
+		elif not _is_status_notice(str(held.get("head") or "")):
+			counts["messages"] += 1
 
 	return counts
 
