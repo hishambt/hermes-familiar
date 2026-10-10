@@ -341,6 +341,12 @@ _STATUS_NOTICE_PATTERNS = (
 	re.compile(r"^\s*\U0001f4be\s*(?:Self-improvement review:|Skill\s)"),
 	re.compile(r"^\s*\[Background process\s+\S+\s+(?:finished with exit code|is still running~)"),
 	re.compile(r"^\s*[\u2705\u274c]\s*Hermes update\s+(?:finished|failed|timed out)"),
+	# The compaction's own two handoffs: the note that opens a compacted transcript, and the elision it leaves where a
+	# long tool output was. Both say outright that they are not the conversation, and both were read as messages.
+	re.compile(r"^\s*\[PRIOR CONTEXT\b"),
+	re.compile(r"^\s*\[[^\]]*\boutput demoted at compaction\b"),
+	# A session reset: the reader's own /new, reported back into the conversation as the machine's word for it.
+	re.compile(r"^\s*\u2728\s*Session reset!"),
 )
 
 
