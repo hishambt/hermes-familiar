@@ -1114,6 +1114,9 @@ def _seed_conversation() -> None:
         # now says four while only two of those rows are things a reader can see - the shape of the real
         # report: a row reading 57 messages over a thread drawing 56.
         db.append_message(AFTER_RESET_ID, "session_meta", "")
+        # And a NOTICE: a row a reader can SEE, which is drawn as a notice rather than counted as something said.
+        # The count a reader is shown is about the conversation alone, so this one must not move `message_count`.
+        db.append_message(AFTER_RESET_ID, "assistant", "[PRIOR CONTEXT \u2014 for reference only; not a new message]")
         db.append_message(AFTER_RESET_ID, "assistant", "")
         db._conn.execute(
             "UPDATE messages SET display_kind = 'hidden' WHERE session_id = ? AND role = 'assistant' AND content = ''",
@@ -1226,6 +1229,17 @@ check(
     "and every session of it still answers for ITSELF, which is what a list of sessions draws",
     [row["message_count"] for row in _from_mid["sessions"]] == [5, 7, 1, 2],
     str([row["message_count"] for row in _from_mid["sessions"]]),
+)
+check(
+    "and a NOTICE is not counted as a message: the two numbers a reader is shown are counted apart",
+    [(row["message_count"], row["notice_count"]) for row in _from_mid["sessions"]]
+    == [(5, 0), (7, 0), (1, 0), (2, 1)],
+    str([(row["message_count"], row["notice_count"]) for row in _from_mid["sessions"]]),
+)
+check(
+    "and the conversation's own total keeps the same two apart",
+    _from_mid["total"]["message_count"] == 15 and _from_mid["total"]["notice_count"] == 1,
+    str((_from_mid["total"]["message_count"], _from_mid["total"]["notice_count"])),
 )
 check(
     "a session whose parent was RESET is part of that conversation, not a conversation of its own",

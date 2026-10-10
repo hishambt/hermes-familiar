@@ -26,6 +26,22 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# The notice rule lives in the plugin's own adapter, and the count here needs it: a notice is something that HAPPENED
+# to a conversation, and ``adapter._delivery_kind`` already says which delivered rows those are. The plugin loads as a
+# package; the check suite loads these files flat, hence both spellings.
+try:
+	from .adapter import _is_status_notice
+except ImportError:  # pragma: no cover - the flat load is the check suite's
+	from adapter import _is_status_notice
+
+# The notice rule lives in the plugin's own adapter, and the count here needs it: a notice is something that HAPPENED
+# to a conversation, and ``adapter._delivery_kind`` already says which delivered rows those are. The plugin loads as a
+# package; the check suite loads these files flat, hence both spellings.
+try:
+	from .adapter import _is_status_notice
+except ImportError:  # pragma: no cover - the flat load is the check suite's
+	from adapter import _is_status_notice
+
 logger = logging.getLogger(__name__)
 
 
@@ -191,59 +207,74 @@ def _children(conn: Any, session_id: str) -> List[Dict[str, Any]]:
 	return [row for row in (_with_recency(_row_dict(cursor, row)) for row in cursor.fetchall()) if row]
 
 
-def _conversation_total(chain: List[Dict[str, Any]], visible: Optional[int] = None) -> Dict[str, Any]:
+def _conversation_total(chain: List[Dict[str, Any]], counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
 	"""What the sessions of one conversation add up to.
 
 	`estimated_cost_usd` stays null when no session in the chain reported one: a total nobody gave is not zero,
 	and the app decides what to draw from that.
 
-	`visible` is the conversation's own message count, counted once across the chain by `_conversation_visible`. It is
-	passed in rather than read off the newest session's entry, because those entries are a SESSION's numbers and are
-	drawn as such: a row in a list of sessions must answer for that session, not for its whole lineage.
+	`counts` is the conversation's own reading, counted once across the chain by `_conversation_visible`: the
+	messages it holds and the notices that only happened to it. It is passed in rather than read off the newest
+	session's entry, because those entries are a SESSION's numbers and are drawn as such: a row in a list of sessions
+	must answer for that session, not for its whole lineage.
 	"""
 	total: Dict[str, Any] = {field: sum(_number(row.get(field)) for row in chain) for field in CONVERSATION_SUMS}
 	reported = [row.get("estimated_cost_usd") for row in chain if row.get("estimated_cost_usd") is not None]
 	carrier = chain[-1] if chain else {}
 
 	total.update({field: _number(carrier.get(field)) for field in CONVERSATION_CARRIED})
-	total["message_count"] = visible if visible is not None else _number(carrier.get("message_count"))
+	total["message_count"] = counts["messages"] if counts is not None else _number(carrier.get("message_count"))
+	total["notice_count"] = counts["notices"] if counts is not None else 0
 	total["estimated_cost_usd"] = sum(_number(cost) for cost in reported) if reported else None
 	total["sessions"] = len(chain)
 
 	return total
 
 
-def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, int]:
-	"""How many messages each of these sessions holds that a reader can see, in ONE query.
+def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, Dict[str, int]]:
+	"""How many MESSAGES and how many NOTICES each of these sessions holds, in ONE query.
 
-	The rule below is the app's own (`saysSomething`). It is asked for a page of sessions at once because the
-	sessions list answers up to two hundred of them, and a count per row would be a query per row.
+	The rule below is the app's own (``saysSomething``): a row a reader can see, and never a ``hidden`` one - the
+	bookkeeping the store writes once per session. It is then parted the way a thread DRAWS it, because the count a
+	reader is shown is about the conversation alone: ``adapter._delivery_kind`` already says a notice is something
+	that happened to a conversation rather than something said in it, and counting one as a message is what made a
+	count disagree with the transcript under it.
+
+	The rows' own words come back rather than a count of them, because telling a notice from a message is a list of
+	regular expressions and SQLite has none. Still ONE query per page - the sessions list answers up to two hundred
+	of them, and a count per row would be a query per row.
+
+	The head is truncated because every pattern is anchored at the start of the row.
 	"""
 	if not session_ids:
 		return {}
 
 	marks = ", ".join("?" for _ in session_ids)
 	cursor = conn.execute(
-		f"""SELECT session_id, count(*) AS visible FROM messages
+		f"""SELECT session_id, coalesce(substr(content, 1, 200), '') AS head FROM messages
 		    WHERE session_id IN ({marks})
 		      AND coalesce(display_kind, '') <> 'hidden'
 		      AND (trim(coalesce(content, '')) <> ''
 		           OR coalesce(trim(tool_calls), '') NOT IN ('', '[]', 'null')
 		           OR coalesce(reasoning, '') <> ''
-		           OR coalesce(reasoning_content, '') <> '')
-		    GROUP BY session_id""",
+		           OR coalesce(reasoning_content, '') <> '')""",
 		tuple(session_ids),
 	)
-	found: Dict[str, int] = {}
+	found: Dict[str, Dict[str, int]] = {}
 
 	for row in cursor.fetchall():
 		held = _row_dict(cursor, row) or {}
-		found[str(held.get("session_id"))] = int(held.get("visible") or 0)
+		counted = found.setdefault(str(held.get("session_id")), {"messages": 0, "notices": 0})
+
+		if _is_status_notice(str(held.get("head") or "")):
+			counted["notices"] += 1
+		else:
+			counted["messages"] += 1
 
 	return found
 
 
-def _conversation_visible(conn: Any, session_ids: List[str]) -> int:
+def _conversation_visible(conn: Any, session_ids: List[str]) -> Dict[str, int]:
 	"""How many messages a reader can see across a whole conversation, counting each one ONCE.
 
 	The sessions of one conversation overlap. A compaction COPIES the transcript into its child - measured on a real
@@ -256,25 +287,31 @@ def _conversation_visible(conn: Any, session_ids: List[str]) -> int:
 	stands in, which only ever matches itself.
 	"""
 	if not session_ids:
-		return 0
+		return {"messages": 0, "notices": 0}
 
 	marks = ", ".join("?" for _ in session_ids)
 	cursor = conn.execute(
-		f"""SELECT count(*) AS visible FROM (
-		        SELECT coalesce(nullif(hex(display_identity), ''), 'id:' || id) AS one
-		        FROM messages
-		        WHERE session_id IN ({marks})
-		          AND coalesce(display_kind, '') <> 'hidden'
-		          AND (trim(coalesce(content, '')) <> ''
-		               OR coalesce(trim(tool_calls), '') NOT IN ('', '[]', 'null')
-		               OR coalesce(reasoning, '') <> ''
-		               OR coalesce(reasoning_content, '') <> '')
-		        GROUP BY one)""",
+		f"""SELECT coalesce(nullif(hex(display_identity), ''), 'id:' || id) AS one,
+		           coalesce(substr(min(content), 1, 200), '') AS head
+		    FROM messages
+		    WHERE session_id IN ({marks})
+		      AND coalesce(display_kind, '') <> 'hidden'
+		      AND (trim(coalesce(content, '')) <> ''
+		           OR coalesce(trim(tool_calls), '') NOT IN ('', '[]', 'null')
+		           OR coalesce(reasoning, '') <> ''
+		           OR coalesce(reasoning_content, '') <> '')
+		    GROUP BY one""",
 		tuple(session_ids),
 	)
-	held = _row_dict(cursor, cursor.fetchone()) or {}
+	counts = {"messages": 0, "notices": 0}
 
-	return int(held.get("visible") or 0)
+	# One of a group speaks for it: a copy keeps its content byte for byte, so a message carried into a child is
+	# classified the same on either side of the compaction that copied it.
+	for row in cursor.fetchall():
+		held = _row_dict(cursor, row) or {}
+		counts["notices" if _is_status_notice(str(held.get("head") or "")) else "messages"] += 1
+
+	return counts
 
 
 def _conversation_chain(conn: Any, session_id: str) -> List[Dict[str, Any]]:
@@ -338,10 +375,10 @@ def _conversation_chain(conn: Any, session_id: str) -> List[Dict[str, Any]]:
 	return chain
 
 
-def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, int], visible: Optional[int]) -> Dict[str, Any]:
+def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, Dict[str, int]], counts: Optional[Dict[str, int]]) -> Dict[str, Any]:
 	"""What a conversation reports, given its chain and the count the caller took for it.
 
-	``visible`` is None when the caller asked for the conversation WITHOUT its total: the total is a scan of every
+	``counts`` is None when the caller asked for the conversation WITHOUT its total: the total is a scan of every
 	message the conversation holds, and a reader that does not draw it should not make the store do that. It is then
 	null rather than the newest session's count, which is a SESSION's number and would be read as the conversation's.
 	"""
@@ -351,11 +388,12 @@ def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, int], visibl
 		"sessions": [
 			{
 				**{field: row.get(field) for field in CONVERSATION_FIELDS},
-				"message_count": each.get(str(row.get("id")), row.get("message_count")),
+				"message_count": (each.get(str(row.get("id"))) or {}).get("messages", row.get("message_count")),
+				"notice_count": (each.get(str(row.get("id"))) or {}).get("notices"),
 			}
 			for row in chain
 		],
-		"total": None if visible is None else _conversation_total(chain, visible),
+		"total": None if counts is None else _conversation_total(chain, counts),
 	}
 
 
@@ -443,17 +481,18 @@ def _api_error(message: str, code: str) -> Dict[str, Any]:
 	return {"error": {"message": message, "type": "invalid_request_error", "param": None, "code": code}}
 
 
-def _session_payload(session: Dict[str, Any], visible: Optional[int] = None) -> Dict[str, Any]:
+def _session_payload(session: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
 	"""One session, in the shape the instance's API answers with.
 
 	The fields are the API server's own client-safe list (``api_server.py::_session_response``): a full system
 	prompt or model config never crosses a client surface, only whether one is there. Copied deliberately and kept
 	identical, because the app parses that shape and a second one would drift from it.
 
-	ONE deviation, and it is the number rather than the shape: ``visible`` replaces ``message_count`` with what
-	``_visible_counts`` read from the store. The app draws a session's transcript and puts that count beside it, so a
-	row of bookkeeping the store counts - a ``session_meta`` row, which holds nothing and exists once per session -
-	left the header saying "53 of 54" over 53 messages. The shape stays the API's; the count is the reader's.
+	TWO deviations, and both are NUMBERS rather than the shape: what ``_visible_counts`` read from the store replaces
+``message_count``, and ``notice_count`` joins it. The app draws a session's transcript and puts those counts beside it,
+so a row of bookkeeping the store counts - a ``session_meta`` row, which holds nothing and exists once per session -
+left the header saying "53 of 54" over 53 messages. The shape stays the API's; the counts are the reader's, and a
+notice is drawn as a notice rather than counted as something said.
 	"""
 	safe_keys = (
 		"id", "source", "user_id", "model", "title", "started_at", "ended_at", "end_reason",
@@ -467,8 +506,9 @@ def _session_payload(session: Dict[str, Any], visible: Optional[int] = None) -> 
 	payload["has_system_prompt"] = bool(session.get("system_prompt"))
 	payload["has_model_config"] = bool(session.get("model_config"))
 
-	if visible is not None:
-		payload["message_count"] = visible
+	if counts is not None:
+		payload["message_count"] = counts.get("messages", payload.get("message_count"))
+		payload["notice_count"] = counts.get("notices", 0)
 
 	return payload
 
