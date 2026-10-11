@@ -1554,7 +1554,32 @@ async def _standalone_send(
 	}
 
 def register(ctx) -> None:
-	"""Plugin entry point, called once at startup."""
+	"""Plugin entry point, called once at startup.
+
+	Two things are declared here, and the second is the whole reason a reader never edits a config: the job draft asks
+	a MODEL something, and Hermes gates that per plugin. Registering the auxiliary task IS the grant - a task key a
+	plugin registered itself is always allowed - and it gives the task its own entry in the machine's model picker, so
+	which model drafts a job is a choice in the UI with the machine's main model as the default.
+	"""
+	# Imported inside the function, like the adapter's other cross-file import: at module level this file and draft.py
+	# would be fine, but the check suite loads these files flat and the package load does not, and one spelling that
+	# works in both is worth more than a module-level import.
+	try:
+		from . import draft as _draft
+	except ImportError:  # pragma: no cover - the flat load is the check suite's
+		import draft as _draft
+
+	# Tolerant of a host that cannot grant it: this plugin's reason to exist is the CHANNEL, and a machine whose Hermes
+	# predates the plugin-LLM API must still get one. Without the grant the draft answers "no model handle" - which is
+	# the truth - rather than the channel going down with it.
+	if hasattr(ctx, "register_auxiliary_task"):
+		ctx.register_auxiliary_task(
+			_draft.DRAFT_TASK,
+			display_name=_draft.DRAFT_TASK_LABEL,
+			description=_draft.DRAFT_TASK_DESCRIPTION,
+		)
+	_draft.set_llm(getattr(ctx, "llm", None))
+
 	ctx.register_platform(
 		name="familiar",
 		label="Familiar",

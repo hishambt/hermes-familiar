@@ -28,6 +28,13 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+# The job draft's model call, in its own file: it is the one thing here that is not the machine's own state. Module
+# level because it imports nothing back - so there is no order to get wrong, unlike the adapter's own import below.
+try:
+	from . import draft as _draft
+except ImportError:  # pragma: no cover - the flat load is the check suite's
+	import draft as _draft
+
 # The notice rule lives in the plugin's own adapter, and the count here needs it: a notice is something that HAPPENED
 # to a conversation, and ``adapter._delivery_kind`` already says which delivered rows those are. The plugin loads as a
 # package; the check suite loads these files flat, hence both spellings.
@@ -70,6 +77,9 @@ _API_ROUTES = (
 	# Not one of Hermes' paths either: nothing upstream lists what this machine can run from its scripts directory,
 	# and a reader choosing a script should be shown what is actually there rather than a path they have to spell.
 	("GET", r"/familiar/scripts", "_api_scripts"),
+	# The one call here that reaches a MODEL. It creates nothing: what comes back fills a form the reader corrects, so
+	# a draft nobody liked costs one message rather than a job nobody wanted.
+	("POST", r"/familiar/jobs/draft", "_api_draft_job"),
 )
 
 #: How many matches of a search this machine will READ to count them. Counting a search is reading it: Hermes'
@@ -1334,6 +1344,53 @@ class FamiliarAnswerRoutes:
 
 		return rows
 
+
+	async def _api_draft_job(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""POST /familiar/jobs/draft - a job drafted from the reader's own words.
+
+		The whole reason this call is allowed: the plugin REGISTERED the auxiliary task it asks through, and a task a
+		plugin registered itself needs no config from anybody.
+
+		Nothing is created here. The answer fills a form the reader corrects, which is why a draft that is wrong costs
+		one message - and why the machine's own facts travel WITH the request: a model with no tools cannot list a
+		directory, so the scripts that exist (a name it invented would be refused), the topics a reader watches, and the
+		draft so far when this is a correction are all handed to it.
+		"""
+		fields = body if isinstance(body, dict) else {}
+		ask = str(fields.get("ask") or "").strip()
+
+		if not ask:
+			return {"status": 400, "body": _api_error("Describe the job you want.", "invalid_ask")}
+
+		if not _draft.available():
+			# Said plainly rather than failed vaguely: on a machine whose plugin has no model handle that IS the reason,
+			# and it is the reader's to act on.
+			return {"status": 503, "body": _api_error(
+				"This machine cannot draft a job: its Familiar plugin has no model handle.", "draft_unavailable")}
+
+		current = fields.get("draft")
+		topics = fields.get("topics")
+
+		try:
+			answer = await _draft.draft_job(
+				ask,
+				machine=str(fields.get("machine") or ""),
+				scripts=await asyncio.to_thread(self._script_names),
+				topics=[str(one) for one in topics] if isinstance(topics, list) else [],
+				current=current if isinstance(current, dict) else None,
+			)
+		except Exception as error:  # noqa: BLE001 - the reason is the model's or the host's, and it is passed on
+			return {"status": 502, "body": _api_error(str(error), "draft_failed")}
+
+		return {"status": 200, "body": {"draft": answer}}
+
+	def _script_names(self) -> List[str]:
+		"""The scripts this machine could actually run, by name - what a draft has to choose from.
+
+		Only the runnable ones: offering a file the create door would refuse would invite a draft nobody can save.
+		"""
+		return [str(row.get("name")) for row in self._script_files() if row.get("runnable")]
 
 	async def _api_update_job(
 			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:

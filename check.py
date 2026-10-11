@@ -115,18 +115,65 @@ print(f"stub receiver on {URL}\n")
 
 # A real job in this run's cron store, so the name lookup is exercised against the same API a gateway uses.
 # HERMES_HOME already points at a temp directory, so nothing here reads or writes the real one.
+import draft  # noqa: E402
 from cron.jobs import create_job  # noqa: E402
 
 JOB_ID = create_job(prompt="probe", schedule="0 4 * * *", name="Delivery probe")["id"]
 
 # 1. Registration: what Hermes reads off the entry.
 print("registration")
+class _Reply:
+    """What the host's structured call answers with, for the draft to read."""
+
+    def __init__(self, parsed):
+        self.parsed = parsed
+
+
+class _FakeLlm:
+    """Stands in for the host's plugin-LLM handle: records each call, and answers with what the test tells it to.
+
+    The DRAFT runs on a real model in production, so what is worth checking here is everything around it - which task
+    it was asked on (the one this plugin registered, which is the whole reason the call is allowed), what travelled
+    with the question, and what happens when the answer is not a draft.
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.parsed = True
+        self.answer = {
+            "shape": "script",
+            "name": "Nightly backup",
+            "schedule": "0 3 * * *",
+            "prompt": "",
+            "script": "probe.py",
+            "script_text": None,
+            "monitor_url": None,
+            "deliver": "familiar",
+            "topic": None,
+            "why": "Runs the backup script every night.",
+        }
+
+    async def acomplete_structured(self, **kwargs):
+        self.calls.append(kwargs)
+
+        return _Reply(self.answer if self.parsed else None)
+
+
+fake_llm = _FakeLlm()
+
+
 class Ctx:
     def __init__(self):
         self.kwargs = None
+        self.aux_tasks = []
 
     def register_platform(self, **kwargs):
         self.kwargs = kwargs
+
+    def register_auxiliary_task(self, key, **kwargs):
+        self.aux_tasks.append({"key": key, **kwargs})
+
+    llm = fake_llm
 
 
 ctx = Ctx()
@@ -984,6 +1031,76 @@ check(
     and _script_rows.get("probe.py", {}).get("runnable") is True,
     str(_script_rows.get("probe.py"))[:200],
 )
+# The job draft: the one call in this plugin that reaches a MODEL, and the only reason it may - this plugin registered
+# the auxiliary task it asks through, and Hermes allows a task a plugin registered ITSELF with no config from anybody.
+check(
+    "registers the auxiliary task it drafts through, which is what makes the call allowed",
+    [task.get("key") for task in ctx.aux_tasks] == [draft.DRAFT_TASK],
+    str(ctx.aux_tasks)[:200],
+)
+
+_nothing_asked = result_of({"id": "draft-1", "action": "api", "method": "POST", "path": "/familiar/jobs/draft",
+	"body": {"ask": "   "}})
+check(
+    "a draft with nothing asked is refused rather than sent to a model",
+    _nothing_asked.get("status") == 400
+    and ((_nothing_asked.get("body") or {}).get("error") or {}).get("code") == "invalid_ask",
+    str(_nothing_asked)[:200],
+)
+
+fake_llm.calls.clear()
+_drafted = result_of({"id": "draft-2", "action": "api", "method": "POST", "path": "/familiar/jobs/draft",
+	"body": {"ask": "back up my notes every night", "machine": "a machine under test", "topics": ["Home", "Jobs"]}})
+_sent = fake_llm.calls[-1] if fake_llm.calls else {}
+_blocks = "\n".join(str(getattr(part, "text", "") or "") for part in (_sent.get("input") or []))
+check(
+    "the draft is asked on the plugin's OWN task, with the schema that is the contract with the form",
+    _drafted.get("status") == 200 and _sent.get("task") == draft.DRAFT_TASK
+    and _sent.get("json_schema") is draft.DRAFT_SCHEMA,
+    str(_sent.get("task"))[:120],
+)
+check(
+    "and the machine's own facts travel with it, because a model with no tools cannot read them",
+    "back up my notes every night" in _blocks
+    and "a machine under test" in _blocks
+    and "Home" in _blocks,
+    _blocks[:240],
+)
+check(
+    "and only the scripts this machine could actually RUN are offered, so a draft can always be saved",
+    "probe.py" in _blocks and "notes.txt" not in _blocks,
+    _blocks[:240],
+)
+check(
+    "what comes back is a DRAFT, not a job",
+    ((_drafted.get("body") or {}).get("draft") or {}).get("shape") == "script",
+    str(_drafted)[:200],
+)
+
+# An answer that is not a draft is REPORTED. A form quietly filled with nothing would be worse than a form that says
+# the draft failed - the reader would be correcting a job that was never described.
+fake_llm.parsed = False
+_not_a_draft = result_of({"id": "draft-3", "action": "api", "method": "POST", "path": "/familiar/jobs/draft",
+	"body": {"ask": "something"}})
+check(
+    "a reply that is not a usable draft is refused, not guessed at",
+    _not_a_draft.get("status") == 502
+    and ((_not_a_draft.get("body") or {}).get("error") or {}).get("code") == "draft_failed",
+    str(_not_a_draft)[:200],
+)
+fake_llm.parsed = True
+
+# And a machine whose plugin holds no model handle says THAT, rather than failing later with the reader watching.
+draft.set_llm(None)
+_no_model = result_of({"id": "draft-4", "action": "api", "method": "POST", "path": "/familiar/jobs/draft",
+	"body": {"ask": "anything at all"}})
+check(
+    "no model handle is its own refusal, naming the reason",
+    _no_model.get("status") == 503 and "model handle" in str(_no_model),
+    str(_no_model)[:200],
+)
+draft.set_llm(fake_llm)
+
 check(
     "and the one that cannot run still appears, saying why",
     _script_rows.get("probe.js", {}).get("runnable") is False
