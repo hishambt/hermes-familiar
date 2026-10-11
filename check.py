@@ -869,11 +869,126 @@ check(
 )
 
 refused_field = result_of({"id": "more-8", "action": "api", "method": "PATCH", "path": f"/api/jobs/{job_id}",
-	"body": {"script": "/tmp/probe.sh"}})
+	"body": {"nonsense": "value"}})
 check(
     "a field nobody may set is refused rather than stored",
     refused_field.get("status") == 400,
     str(refused_field)[:200],
+)
+
+# A script IS settable now - a script job is the one that costs nothing to run - but only a script this machine can
+# actually run. The check is the SCHEDULER'S own rule applied at creation instead of at the first tick, because the
+# store itself only reads the file (to scan it for lifecycle commands) and never asks whether it is there.
+# The fixtures go in the temp home's scripts directory, which is where the code looks and the only legal home.
+_scripts = Path(os.environ["HERMES_HOME"]) / "scripts"
+_scripts.mkdir(parents=True, exist_ok=True)
+(_scripts / "probe.py").write_text("print('ok')\n", encoding="utf-8")
+(_scripts / "probe.js").write_text("console.log('no')\n", encoding="utf-8")
+(_scripts / "notes.txt").write_text("hello\n", encoding="utf-8")
+
+missing = result_of({"id": "more-8a", "action": "api", "method": "PATCH", "path": f"/api/jobs/{job_id}",
+	"body": {"script": "ghost.py"}})
+check(
+    "a script that is not there is refused, naming where it looked",
+    missing.get("status") == 400 and "No script at" in str(missing),
+    str(missing)[:240],
+)
+
+outside = result_of({"id": "more-8b", "action": "api", "method": "PATCH", "path": f"/api/jobs/{job_id}",
+	"body": {"script": "/tmp/probe.sh"}})
+check(
+    "a script outside the scripts directory is refused, by the directory",
+    outside.get("status") == 400 and "has to live in" in str(outside),
+    str(outside)[:240],
+)
+
+foreign = result_of({"id": "more-8c", "action": "api", "method": "PATCH", "path": f"/api/jobs/{job_id}",
+	"body": {"script": "probe.js"}})
+check(
+    "a .js file is refused rather than handed to Python",
+    foreign.get("status") == 400 and "handed to Python" in str(foreign),
+    str(foreign)[:240],
+)
+
+turned = result_of({"id": "more-8d", "action": "api", "method": "PATCH", "path": f"/api/jobs/{job_id}",
+	"body": {"script": "probe.py", "no_agent": True}})
+check(
+    "a job can be turned into a script job, no_agent with it",
+    turned.get("status") == 200
+    and ((turned.get("body") or {}).get("job") or {}).get("script") == "probe.py"
+    and ((turned.get("body") or {}).get("job") or {}).get("no_agent") is True,
+    str(turned)[:240],
+)
+
+# And a script job can be CREATED here, which is the whole point of the door: no model is in the loop, so a run
+# costs nothing at all.
+script_job = result_of({"id": "more-8e", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Nightly backup", "schedule": "0 3 * * *", "script": "probe.py", "no_agent": True,
+		"deliver": "local"}})
+check(
+    "a script job is created with no model in the loop",
+    script_job.get("status") == 200
+    and ((script_job.get("body") or {}).get("job") or {}).get("script") == "probe.py"
+    and ((script_job.get("body") or {}).get("job") or {}).get("no_agent") is True,
+    str(script_job)[:240],
+)
+
+# The store's own invariant arriving as a refusal through this door: nothing to run is not a job. It comes back as
+# `invalid_job` rather than a shape of our own, because the store is what says so.
+lonely = result_of({"id": "more-8f", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Nothing to run", "schedule": "0 3 * * *", "no_agent": True, "deliver": "local"}})
+check(
+    "no_agent with no script is refused, in the store's own words",
+    # `invalid_job` is the code the app branches on, and it arrives inside the error envelope every refusal here
+    # uses - `body.error.code`, not `body.code`.
+    lonely.get("status") == 400
+    and ((lonely.get("body") or {}).get("error") or {}).get("code") == "invalid_job"
+    and "requires a script" in str(lonely),
+    str(lonely)[:240],
+)
+
+# A monitor is the shape that wakes the agent only when something CHANGED, and its URL has to be one a fetch could
+# make - refused here rather than at 3am.
+bad_url = result_of({"id": "more-8g", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Watch a feed", "schedule": "*/5 * * * *", "prompt": "summarise what changed",
+		"monitor_url": "ftp://example.com/feed", "deliver": "local"}})
+check(
+    "a monitor URL that is not http(s) is refused, not stored",
+    bad_url.get("status") == 400 and "http(s)" in str(bad_url),
+    str(bad_url)[:240],
+)
+
+# And the combination the store refuses outright, because the point of a monitor is to suppress or wake an AGENT and
+# a no_agent job has none to wake.
+useless_monitor = result_of({"id": "more-8h", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Monitor with nobody to wake", "schedule": "*/5 * * * *", "script": "probe.py",
+		"no_agent": True, "monitor_url": "https://example.com/feed", "deliver": "local"}})
+check(
+    "a monitor on a no_agent job is refused, so the pair cannot be stored",
+    useless_monitor.get("status") == 400,
+    str(useless_monitor)[:240],
+)
+
+# What the app offers instead of a path field: the directory itself. A file that would be handed to the wrong
+# interpreter is still LISTED - hiding it would leave a reader wondering where it went - and it says why.
+listed_scripts = asyncio.run(live._api_scripts({}, {}, None)).get("body") or {}
+_script_rows = {row.get("name"): row for row in listed_scripts.get("data") or []}
+check(
+    "the scripts this machine can run are listed by name",
+    [row.get("name") for row in listed_scripts.get("data") or []] == ["notes.txt", "probe.js", "probe.py"],
+    str(listed_scripts)[:240],
+)
+check(
+    "and each says how it would run, by its suffix",
+    _script_rows.get("probe.py", {}).get("language") == "python"
+    and _script_rows.get("probe.py", {}).get("runnable") is True,
+    str(_script_rows.get("probe.py"))[:200],
+)
+check(
+    "and the one that cannot run still appears, saying why",
+    _script_rows.get("probe.js", {}).get("runnable") is False
+    and "handed to Python" in str(_script_rows.get("probe.js", {}).get("reason")),
+    str(_script_rows.get("probe.js"))[:200],
 )
 
 paused = result_of({"id": "more-9", "action": "api", "method": "POST", "path": f"/api/jobs/{job_id}/pause"})

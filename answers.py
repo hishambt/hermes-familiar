@@ -19,7 +19,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import re
+import shutil
 import time
 import urllib
 import uuid
@@ -65,6 +67,9 @@ _API_ROUTES = (
 	("PATCH", r"/api/jobs/(?P<job>[^/]+)", "_api_update_job"),
 	("DELETE", r"/api/jobs/(?P<job>[^/]+)", "_api_delete_job"),
 	("POST", r"/api/jobs/(?P<job>[^/]+)/(?P<action>run|pause|resume)", "_api_job_action"),
+	# Not one of Hermes' paths either: nothing upstream lists what this machine can run from its scripts directory,
+	# and a reader choosing a script should be shown what is actually there rather than a path they have to spell.
+	("GET", r"/familiar/scripts", "_api_scripts"),
 )
 
 #: How many matches of a search this machine will READ to count them. Counting a search is reading it: Hermes'
@@ -80,7 +85,80 @@ _SEARCH_COUNT_CEILING = 5000
 #: The cron store's own limits, copied from the API server so a job made down the connection is held to exactly
 #: what one made over HTTP is held to: one rule, whichever door it came through.
 _JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
-_JOB_UPDATE_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+_JOB_UPDATE_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled",
+	"script", "no_agent", "monitor_url", "monitor_script"}
+
+#: The two families a job's script can belong to. The SUFFIX decides the interpreter and the shebang is ignored on
+#: purpose (``cron.scheduler_script._script_argv``), so a ``.js`` file is not a JavaScript job - it is handed to
+#: Python. That is why such a file is refused at creation here rather than failing on its first run at 3am.
+_SCRIPT_PY_SUFFIXES = (".py",)
+_SCRIPT_BASH_SUFFIXES = (".sh", ".bash")
+
+
+def _scripts_directory() -> Path:
+	"""This machine's scripts directory, which is the only place a job's script is ever run from."""
+	from hermes_constants import get_hermes_home
+
+	return Path(get_hermes_home()) / "scripts"
+
+
+def _script_refusal(raw: Any) -> str:
+	"""Why *raw* cannot be a job's script, or "" when it can.
+
+	Mirrors the two rules the SCHEDULER applies at run time: ``cron.scheduler_script._resolve_script_path`` (the
+	containment and the file checks) and ``_script_argv`` (the interpreter). Copied deliberately, because nothing
+	shares them - and because what is refused here would otherwise have become a job that fails with nobody
+	watching. One function, named after its sources, so the copy is visible and a third language upstream is a
+	one-line fix here.
+	"""
+	value = str(raw or "").strip()
+
+	if not value:
+		return ""
+
+	if "\x00" in value:
+		return "A script path cannot contain a NUL byte"
+
+	directory = _scripts_directory()
+
+	try:
+		raw_path = Path(value).expanduser()
+		path = raw_path.resolve() if raw_path.is_absolute() else (directory / raw_path).resolve()
+	except (ValueError, RuntimeError, OSError):
+		return f"Not a usable script path: {value!r}"
+
+	try:
+		path.relative_to(directory.resolve())
+	except ValueError:
+		return (f"A job's script has to live in {directory} - the only directory this machine runs one from. "
+			f"{value!r} resolves outside it.")
+
+	if not path.exists():
+		return f"No script at {path}"
+
+	if not path.is_file():
+		return f"{path} is not a file"
+
+	suffix = path.suffix.lower()
+
+	if suffix not in _SCRIPT_PY_SUFFIXES + _SCRIPT_BASH_SUFFIXES:
+		return (f"{path.name!r} would be handed to Python: a script runs as Python or as bash, and the SUFFIX decides "
+			f"which - a shebang is ignored. Name it .py, .sh or .bash.")
+
+	if suffix in _SCRIPT_BASH_SUFFIXES and shutil.which("bash") is None and not os.path.isfile("/bin/bash"):
+		return (f"{path.name!r} cannot run: bash is not on this machine. Rewrite it as Python (.py), or install bash.")
+
+	return ""
+
+
+def _url_refusal(raw: Any) -> str:
+	"""Why *raw* cannot be a job's monitor URL, or "" when it can - the scheme check ``cron.monitor`` makes."""
+	value = str(raw or "").strip()
+
+	if value and not value.lower().startswith(("http://", "https://")):
+		return f"A monitor URL has to be http(s): {value!r}"
+
+	return ""
 _MAX_JOB_NAME = 200
 _MAX_JOB_PROMPT = 5000
 
@@ -1175,6 +1253,32 @@ class FamiliarAnswerRoutes:
 		if repeat is not None:
 			kwargs["repeat"] = repeat
 
+		# A SCRIPT job, and the monitor that can front any job. Both name a script this machine has to be able to
+		# run, so both are checked HERE the way the scheduler will check them at run time. What the two cannot be
+		# TOGETHER - and what `no_agent` cannot be without - is the store's own rule, and comes back as its refusal:
+		# one place decides, whichever door the job came through.
+		for key in ("script", "monitor_script"):
+			value = str(fields.get(key) or "").strip()
+
+			if not value:
+				continue
+
+			problem = _script_refusal(value)
+
+			if problem:
+				return {"status": 400, "body": _api_error(problem, "invalid_job")}
+
+			kwargs[key] = value
+
+		url_problem = _url_refusal(fields.get("monitor_url"))
+
+		if url_problem:
+			return {"status": 400, "body": _api_error(url_problem, "invalid_job")}
+
+		for key in ("no_agent", "monitor_url"):
+			if fields.get(key):
+				kwargs[key] = fields[key]
+
 		try:
 			job = await asyncio.to_thread(lambda: self._cron()["create"](**kwargs))
 		except ValueError as error:
@@ -1187,6 +1291,48 @@ class FamiliarAnswerRoutes:
 			return {"status": status, "body": _api_error(str(error), "job_create_failed")}
 
 		return {"status": 200, "body": {"job": job}}
+
+
+	async def _api_scripts(
+			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+		"""GET /familiar/scripts - what this machine can run, as a job's script.
+
+		A job's script has exactly one legal home - `~/.hermes/scripts/`, the only directory the scheduler runs one
+		from - so the app offers these instead of a path nobody can spell. Each row says how it would RUN: the suffix
+		decides the interpreter, and a file that would be handed to the wrong one says so here rather than failing at
+		3am.
+		"""
+		scripts = await asyncio.to_thread(self._script_files)
+
+		return {"status": 200, "body": {"data": scripts, "total": len(scripts)}}
+
+	def _script_files(self) -> List[Dict[str, Any]]:
+		"""The files in this machine's scripts directory, by name, with how each would run.
+
+		Sorted by name rather than by time: a list of choices is scanned, not read in the order it was written.
+		"""
+		directory = _scripts_directory()
+		rows: List[Dict[str, Any]] = []
+
+		with contextlib.suppress(OSError):
+			for path in sorted(directory.iterdir(), key=lambda one: one.name.lower()):
+				if not path.is_file() or path.name.startswith("."):
+					continue
+
+				# The SAME rule the create door applies, so a file offered here cannot be one that door refuses.
+				refusal = _script_refusal(path.name)
+
+				rows.append({
+					"name": path.name,
+					"language": "bash" if path.suffix.lower() in _SCRIPT_BASH_SUFFIXES else "python",
+					# A file this machine cannot run is still listed: hiding it would leave a reader wondering where
+					# it went, and the reason travels with it.
+					"runnable": not refusal,
+					"reason": refusal,
+					"size": path.stat().st_size,
+				})
+
+		return rows
 
 
 	async def _api_update_job(
@@ -1208,6 +1354,20 @@ class FamiliarAnswerRoutes:
 
 			if problem:
 				return {"status": 400, "body": _api_error(problem, "invalid_job")}
+
+		# The script fields are held to creation's own rule here too: the store checks the COMBINATION on this door
+		# as well, but not the file, and a rename that points a job at nothing must not be stored either.
+		for key in ("script", "monitor_script"):
+			if key in sanitized and str(sanitized[key] or "").strip():
+				problem = _script_refusal(sanitized[key])
+
+				if problem:
+					return {"status": 400, "body": _api_error(problem, "invalid_job")}
+
+		url_problem = _url_refusal(sanitized.get("monitor_url")) if "monitor_url" in sanitized else ""
+
+		if url_problem:
+			return {"status": 400, "body": _api_error(url_problem, "invalid_job")}
 
 		def work() -> Any:
 			job = self._cron()["update"](groups["job"], sanitized)
