@@ -1138,6 +1138,28 @@ check(
     str(_clash)[:240],
 )
 
+# Line endings are the FILE's business, not the editor's. A Windows app sends CRLF, and bash reads a stray carriage
+# return as part of the command - so a .sh written from the app must not arrive broken.
+_windows_script = result_of({"id": "write-3b", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "CRLF probe", "schedule": "0 4 * * *", "script_name": "crlf_probe.sh",
+		"script_text": "#!/bin/sh\r\necho hi\r\n", "deliver": "local"}})
+_written_bytes = (_scripts / "crlf_probe.sh").read_bytes() if (_scripts / "crlf_probe.sh").exists() else b""
+check(
+    "a script typed with Windows line endings is written with the endings a shell can read",
+    _windows_script.get("status") == 200 and b"\r" not in _written_bytes and _written_bytes.endswith(b"echo hi\n"),
+    str(_written_bytes)[:120],
+)
+
+# ... and the same script again is still the same script, because the comparison is made the same way.
+_same_script = result_of({"id": "write-3c", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "CRLF probe again", "schedule": "0 4 * * *", "script_name": "crlf_probe.sh",
+		"script_text": "#!/bin/sh\r\necho hi\r\n", "deliver": "local"}})
+check(
+    "and a retry of it is not mistaken for a different script",
+    _same_script.get("status") == 200,
+    str(_same_script)[:200],
+)
+
 _bad_name = result_of({"id": "write-4", "action": "api", "method": "POST", "path": "/api/jobs",
 	"body": {"name": "Nowhere", "schedule": "0 4 * * *", "script_name": "sub/thing.js",
 		"script_text": "print(1)\n", "deliver": "local"}})

@@ -1450,18 +1450,25 @@ class FamiliarAnswerRoutes:
 			except ValueError as blocked:
 				return "", str(blocked)
 
+		# LF endings, whatever the client sent. A script written from a Windows app arrives with CRLF, and bash reads a
+		# stray carriage return as part of the command - so what the file CONTAINS must not depend on the editor that
+		# typed it. Normalised before the comparison below too, so a retry of the same script still matches.
+		body = text.replace("\r\n", "\n").replace("\r", "\n")
+
 		path = _scripts_directory() / clean
 
 		try:
 			if path.exists():
-				if path.read_text(encoding="utf-8", errors="replace") == text:
+				if path.read_text(encoding="utf-8", errors="replace").replace("\r\n", "\n") == body:
 					return clean, ""
 
 				return "", (f"There is already a script called {clean!r} on this machine, and it is not this one. "
 					f"Pick another name, or choose the existing script instead.")
 
 			path.parent.mkdir(parents=True, exist_ok=True)
-			path.write_text(text, encoding="utf-8")
+			# `newline="\n"` is what makes it stick: writing text on Windows turns every `\n` back into `\r\n` unless
+			# it is said otherwise, which would undo the normalisation above on the way out.
+			path.write_text(body, encoding="utf-8", newline="\n")
 		except OSError as error:
 			return "", f"Could not write {clean!r}: {error}"
 
