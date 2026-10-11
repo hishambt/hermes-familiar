@@ -161,6 +161,25 @@ def _script_refusal(raw: Any) -> str:
 	return ""
 
 
+def _script_name_refusal(name: str) -> str:
+	"""Why *name* cannot be a script's file name, or "" when it can.
+
+	A NEW file, so this is the name's own rules rather than the created-file ones: a bare name with a suffix whose
+	interpreter this machine has, no directories, and nothing that would resolve outside the scripts directory.
+	"""
+	if not name:
+		return "A new script needs a file name."
+
+	if "/" in name or "\\" in name or name.startswith("."):
+		return f"A script's name is a bare file name: {name!r}."
+
+	if Path(name).suffix.lower() not in _SCRIPT_PY_SUFFIXES + _SCRIPT_BASH_SUFFIXES:
+		return (f"{name!r} would be handed to Python: a script runs as Python or as bash, and the SUFFIX decides which. "
+			f"Name it .py, .sh or .bash.")
+
+	return ""
+
+
 def _url_refusal(raw: Any) -> str:
 	"""Why *raw* cannot be a job's monitor URL, or "" when it can - the scheme check ``cron.monitor`` makes."""
 	value = str(raw or "").strip()
@@ -1267,6 +1286,19 @@ class FamiliarAnswerRoutes:
 		# run, so both are checked HERE the way the scheduler will check them at run time. What the two cannot be
 		# TOGETHER - and what `no_agent` cannot be without - is the store's own rule, and comes back as its refusal:
 		# one place decides, whichever door the job came through.
+		# A script the DRAFT wrote and the reader confirmed: there is nowhere else it could be written from, and the
+		# job's own script field is what comes of it. Written here rather than by a door of its own, so a job and the
+		# script it needs arrive together or not at all - a file nobody schedules is as useless as a job with no script.
+		script_text = str(fields.get("script_text") or "")
+
+		if script_text.strip():
+			script_name, write_problem = self._write_script(str(fields.get("script_name") or ""), script_text)
+
+			if write_problem:
+				return {"status": 400, "body": _api_error(write_problem, "invalid_job")}
+
+			fields = {**fields, "script": script_name}
+
 		for key in ("script", "monitor_script"):
 			value = str(fields.get(key) or "").strip()
 
@@ -1384,6 +1416,56 @@ class FamiliarAnswerRoutes:
 			return {"status": 502, "body": _api_error(str(error), "draft_failed")}
 
 		return {"status": 200, "body": {"draft": answer}}
+
+	def _write_script(self, name: str, text: str) -> Tuple[str, str]:
+		"""Put a script into this machine's scripts directory; ``(name, problem)``.
+
+		The name is held to the same directory and the same suffixes the create door holds a script to, because it is the
+		SAME file the scheduler will run - and the text is scanned before it lands, so a script the machine would refuse
+		to schedule is refused here rather than left on disk being useless.
+
+		An existing file is never quietly overwritten: the same script may be scheduled by jobs that are not this one, so
+		identical text is accepted (a retry after a failed create) and different text is refused, which is a name the
+		reader can change rather than somebody else's job broken under them.
+		"""
+		clean = str(name or "").strip()
+		problem = _script_name_refusal(clean)
+
+		if problem:
+			return "", problem
+
+		if not text.strip():
+			return "", "A script needs some text."
+
+		# The store's own guard, run before the file exists: the same scan that would refuse this script at job
+		# creation, applied where the reader can still fix it. The IMPORT is what is optional; the refusal is not, so
+		# only the import is suppressed - swallowing the guard's own answer would make it decoration.
+		try:
+			from cron.lifecycle_guard import check_gateway_lifecycle
+		except Exception:  # noqa: BLE001 - the scanner is optional hardening, never a reason to refuse
+			pass
+		else:
+			try:
+				check_gateway_lifecycle(text)
+			except ValueError as blocked:
+				return "", str(blocked)
+
+		path = _scripts_directory() / clean
+
+		try:
+			if path.exists():
+				if path.read_text(encoding="utf-8", errors="replace") == text:
+					return clean, ""
+
+				return "", (f"There is already a script called {clean!r} on this machine, and it is not this one. "
+					f"Pick another name, or choose the existing script instead.")
+
+			path.parent.mkdir(parents=True, exist_ok=True)
+			path.write_text(text, encoding="utf-8")
+		except OSError as error:
+			return "", f"Could not write {clean!r}: {error}"
+
+		return clean, ""
 
 	def _script_names(self) -> List[str]:
 		"""The scripts this machine could actually run, by name - what a draft has to choose from.

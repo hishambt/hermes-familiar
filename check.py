@@ -1101,6 +1101,63 @@ check(
 )
 draft.set_llm(fake_llm)
 
+# A script a DRAFT wrote and the reader confirmed. The create door is where it becomes real, so a job and the script
+# it needs arrive together - a file nobody schedules is as useless as a job with no script.
+_SELF_WRITTEN = "import tarfile\nprint('backed up')\n"
+
+_written = result_of({"id": "write-1", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Notes backup", "schedule": "0 3 * * *", "script_name": "notes_backup.py",
+		"script_text": _SELF_WRITTEN, "deliver": "local"}})
+check(
+    "a confirmed script is written, and the job that was registered runs it",
+    _written.get("status") == 200
+    and ((_written.get("body") or {}).get("job") or {}).get("script") == "notes_backup.py"
+    and (_scripts / "notes_backup.py").exists(),
+    str(_written)[:240],
+)
+
+# The same text again is a RETRY, not a clash: a create that failed after the write must not need a new name.
+_again = result_of({"id": "write-2", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Notes backup", "schedule": "0 3 * * *", "script_name": "notes_backup.py",
+		"script_text": _SELF_WRITTEN, "deliver": "local"}})
+check(
+    "the same script again is a retry rather than a refusal",
+    _again.get("status") == 200,
+    str(_again)[:200],
+)
+
+# Different text under a name that already exists is somebody ELSE'S script, and the same file may be scheduled by jobs
+# that are not this one. Refused, and left exactly as it was.
+_clash = result_of({"id": "write-3", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Something else", "schedule": "0 4 * * *", "script_name": "probe.py",
+		"script_text": "print('not the same')\n", "deliver": "local"}})
+check(
+    "a name already taken by ANOTHER script is refused, and that script is left alone",
+    _clash.get("status") == 400 and "already a script" in str(_clash)
+    and (_scripts / "probe.py").read_text(encoding="utf-8") == "print('ok')\n",
+    str(_clash)[:240],
+)
+
+_bad_name = result_of({"id": "write-4", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Nowhere", "schedule": "0 4 * * *", "script_name": "sub/thing.js",
+		"script_text": "print(1)\n", "deliver": "local"}})
+check(
+    "a new script's NAME is held to what this machine runs, before anything is written",
+    _bad_name.get("status") == 400 and not (_scripts / "sub").exists(),
+    str(_bad_name)[:240],
+)
+
+# The store's own lifecycle guard, run BEFORE the file exists: a script the machine would refuse to schedule is not
+# left lying on disk being useless, and the reader hears why while they are still looking at it.
+_unschedulable = result_of({"id": "write-5", "action": "api", "method": "POST", "path": "/api/jobs",
+	"body": {"name": "Restart the gateway", "schedule": "0 4 * * *", "script_name": "restart_gateway.py",
+		"script_text": "import os\nos.system('systemctl restart hermes-gateway')\n", "deliver": "local"}})
+check(
+    "a script the machine would refuse to schedule is refused BEFORE it is written",
+    _unschedulable.get("status") == 400 and not (_scripts / "restart_gateway.py").exists(),
+    str(_unschedulable)[:260],
+)
+
 check(
     "and the one that cannot run still appears, saying why",
     _script_rows.get("probe.js", {}).get("runnable") is False

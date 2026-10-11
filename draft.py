@@ -61,6 +61,7 @@ DRAFT_SCHEMA: Dict[str, Any] = {
         "schedule",
         "prompt",
         "script",
+        "script_name",
         "script_text",
         "monitor_url",
         "deliver",
@@ -101,6 +102,14 @@ DRAFT_SCHEMA: Dict[str, Any] = {
             "description": (
                 "The NAME of a script that already exists on the machine, taken from the list given to you. null when "
                 "the shape runs no script, or when script_text is used instead."
+            ),
+        },
+        "script_name": {
+            "type": ["string", "null"],
+            "description": (
+                "The FILE name for a script written in script_text, with its suffix - 'notes_backup.py' or "
+                "'check_disk.sh'. Lowercase, underscores, no directories. null when an existing script is used or no "
+                "script runs."
             ),
         },
         "script_text": {
@@ -159,8 +168,15 @@ Choose the shape that does the work for the least: a script that needs no model 
 when the work is deterministic. Use an agent when judgement is genuinely needed, and "watch" when the answer is
 usually "nothing changed" - that shape only wakes the agent when something did.
 
-Write `name` short and recognisable, `schedule` in a form the machine parses (a cron expression, "every 30m", or
-"every monday 9am"), and `why` as one plain sentence in the language the request was written in.
+Write `name` short and recognisable, and `schedule` in a form the machine parses (a cron expression, "every 30m", or
+"every monday 9am").
+
+LANGUAGE: everything you write is read by the person who asked, so every string - the name, the schedule, the prompt,
+the script's own comments and its output - is in the SAME LANGUAGE as the request. An answer in another language is a
+wrong answer, whatever it says.
+
+When you write a new script, `script_name` is what the file will be called: a bare name with a .py, .sh or .bash
+suffix, lowercase, and it must not be one of the names you were given.
 
 Fill every field. Use null and the empty string where a field does not apply to the shape you chose - do not omit
 them, and do not invent a fifth shape.
