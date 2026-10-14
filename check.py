@@ -353,6 +353,29 @@ check(
 )
 adapter._clear_token(URL)
 
+# A file still in the FLAT shape getting a port written to it. This is the shape every machine that has ever
+# paired is in, so the first run after an update is exactly this case - and a port write that folded the flat keys
+# away without folding them INTO the map would take the pairing away from every one of those machines.
+adapter._state_path().write_text(json.dumps({"token": "tok_flat_untouched"}), encoding="utf-8")
+adapter._save_ingress_port("flatline", 9101)
+check(
+    "recording a port leaves a FLAT pairing's token exactly where it is",
+    adapter._load_token(URL) == "tok_flat_untouched",
+    adapter._load_token(URL),
+)
+check(
+    "and the port landed beside it, without the file being turned into a map",
+    adapter._load_ingress_port("flatline") == 9101
+    and "pairings" not in json.loads(adapter._state_path().read_text(encoding="utf-8")),
+    adapter._state_path().read_text(encoding="utf-8"),
+)
+adapter._clear_token(URL)
+check(
+    "and clearing that pairing leaves the sibling port section standing",
+    adapter._read_raw().get("ingress", {}).get("flatline") == 9101,
+    adapter._state_path().read_text(encoding="utf-8"),
+)
+
 # The candidate list is the whole contract, and it has two shapes.
 _probe = adapter.FamiliarAdapter(config(url=URL))
 _probe._ingress_port, _probe._ingress_port_set = 9000, True
@@ -453,7 +476,17 @@ check(
     live._presented_token(),
 )
 live._clear_token()
-check("and the check leaves no pairing behind", not adapter._state_path().exists())
+_left_behind = adapter._read_raw()
+check(
+    "and the check leaves no PAIRING behind",
+    not _left_behind.get("pairings") and not _left_behind.get("token") and not _left_behind.get("refused"),
+    json.dumps(_left_behind),
+)
+check(
+    "because going unpaired must not take the port section with it",
+    bool(_left_behind.get("ingress")),
+    json.dumps(_left_behind),
+)
 
 # 2c. One entry per BACKEND. A machine pairs with an ADDRESS, so two Familiars are two entries - and forgetting one
 # is no reason for the other to lose its token. Before this the file held ONE token, so a machine wired to prod and

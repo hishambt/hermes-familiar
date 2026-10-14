@@ -79,6 +79,11 @@ PAIR_PROBE_TICK_S = 0.1
 #: What a paired machine's state is called. Where it lives is `_state_path`.
 STATE_FILE = "state.json"
 
+#: The only keys a PAIRING entry may hold. A sibling section of the same file - the ports - must never end up
+#: inside one: an entry carrying an unrelated key still looks like a pairing that exists, so clearing it would
+#: leave the entry behind and the machine would never read as unpaired again.
+PAIRING_KEYS = ("token", "refused")
+
 #: The directory this plugin keeps that state in, under Hermes' home rather than inside the plugin.
 STATE_DIR = "familiar-platform"
 
@@ -276,7 +281,9 @@ def _migrate(raw: Dict[str, Any], url: str) -> Dict[str, Any]:
 	if isinstance(pairings, dict):
 		out = {str(name): dict(entry) for name, entry in pairings.items() if isinstance(entry, dict)}
 	elif raw.get("token") or raw.get("refused"):
-		out = {key: dict(raw)} if key else {}
+		# The PAIRING keys only. Handing the whole document to the map would make every other section part of a
+		# pairing, and the entry would then outlive its own token.
+		out = {key: {k: v for k, v in raw.items() if k in PAIRING_KEYS}} if key else {}
 	else:
 		out = {}
 
@@ -295,6 +302,16 @@ def _load_pairings(url: str) -> Dict[str, Any]:
 	return _migrate(_read_raw(), url)
 
 
+def _write_raw(state: Dict[str, Any]) -> None:
+	"""Write the machine's state file exactly as given."""
+	try:
+		path = _state_path()
+		path.parent.mkdir(parents=True, exist_ok=True)
+		path.write_text(json.dumps(state, indent="\t"), encoding="utf-8")
+	except Exception as error:  # noqa: BLE001 - state that will not persist is worth a warning, not a crash
+		logger.warning("[familiar] could not save this machine's state: %s", error)
+
+
 def _write_state(**sections: Any) -> None:
 	"""Write sections into the machine's one state file, leaving every OTHER section exactly where it is.
 
@@ -305,15 +322,16 @@ def _write_state(**sections: Any) -> None:
 	"""
 	state = _read_raw()
 	state.update(sections)
-	state.pop("token", None)
-	state.pop("refused", None)
 
-	try:
-		path = _state_path()
-		path.parent.mkdir(parents=True, exist_ok=True)
-		path.write_text(json.dumps(state, indent="\t"), encoding="utf-8")
-	except Exception as error:  # noqa: BLE001 - state that will not persist is worth a warning, not a crash
-		logger.warning("[familiar] could not save this machine's state: %s", error)
+	# ONLY a writer that just folded the flat document into ``pairings`` may remove its keys. A writer that came
+	# to record something else - this profile's port - has not folded anything, and a file still in the flat shape
+	# is a machine that PAIRED that way: dropping ``token`` there would take the pairing away from every machine
+	# that has one, on the first run after it updated.
+	if "pairings" in sections:
+		state.pop("token", None)
+		state.pop("refused", None)
+
+	_write_raw(state)
 
 
 def _save_pairings(pairings: Dict[str, Any]) -> None:
@@ -378,7 +396,7 @@ def _clear_token(url: str = "") -> None:
 	"""Forget THIS backend's pairing, and only this one. Every other Familiar the machine talks to stays paired."""
 	key = _backend_key(url)
 	pairings = _load_pairings(url)
-	entry = dict(pairings.get(key) or {})
+	entry = {k: v for k, v in dict(pairings.get(key) or {}).items() if k in PAIRING_KEYS}
 	entry.pop("token", None)
 
 	if entry:
@@ -388,6 +406,18 @@ def _clear_token(url: str = "") -> None:
 
 	if pairings:
 		_save_pairings(pairings)
+
+		return
+
+	# Nothing is paired through this backend any more. The file may still hold ANOTHER section - the port this
+	# profile's ingress took - so it is the pairings that go, and the file only once nothing is left in it.
+	state = _read_raw()
+	state.pop("pairings", None)
+	state.pop("token", None)
+	state.pop("refused", None)
+
+	if state:
+		_write_raw(state)
 
 		return
 
