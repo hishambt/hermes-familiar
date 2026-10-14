@@ -1128,15 +1128,24 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		Both travel on EVERY connection rather than only when a machine pairs. The version answers "did the update
 		land?" for a machine set up over its shell, which never pairs at all; the port is what Familiar aims a
 		reader's pairing-code command and its own reachability probe at, and since a machine runs one ingress PER
-		PROFILE it cannot be assumed. The connection is the only carrier that is always there, and the bind happens
-		before this is built, so the port named here is one that is really listening.
+		PROFILE it cannot be assumed. The connection is the only carrier that is always there.
+
+		The port is named ONLY while something is listening on it, and the listener IS the state: a bind that failed
+		leaves the number it tried in `_ingress_port`, and announcing that would hand Familiar a port nothing answers
+		on - worse than saying nothing, because the stored port is exactly what the reader's command and the machine's
+		probe aim at, and the machine would look healthy while being unable to take a message at all. Saying nothing
+		leaves the last known answer standing, which the probe then checks against the machine itself.
 		"""
-		return {
+		headers = {
 			"Authorization": f"Bearer {token}",
 			"Accept": "text/event-stream",
 			"X-Familiar-Plugin": PLUGIN_VERSION,
-			"X-Familiar-Ingress": str(self._ingress_port),
 		}
+
+		if self._ingress_runner is not None:
+			headers["X-Familiar-Ingress"] = str(self._ingress_port)
+
+		return headers
 
 	async def _channel_activate(self, frame: Dict[str, Any]) -> Dict[str, Any]:
 		"""Put this channel on ANOTHER profile of this machine, in one step.

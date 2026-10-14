@@ -356,6 +356,75 @@ check(
     str(_probe_headers),
 )
 
+# A port is announced only while something is LISTENING on it. A bind that failed leaves the number it tried in
+# `_ingress_port`, and handing Familiar that would aim a reader's pairing-code command and the machine's own probe
+# at a port nothing answers on - so the machine would read as healthy while being unable to take a message at all,
+# which is the exact failure the port was added to stop. Bound for real, on a port really held by somebody else.
+import aiohttp.web as _aiohttp_web
+import socket as _socket
+
+_holder = _socket.socket()
+_holder.bind(("127.0.0.1", 0))
+_holder.listen(1)
+_held_port = _holder.getsockname()[1]
+
+_probe_free = _socket.socket()
+_probe_free.bind(("127.0.0.1", 0))
+_free_port = _probe_free.getsockname()[1]
+_probe_free.close()
+
+_failing = adapter.FamiliarAdapter(config(url=URL, token="tok_header"))
+_failing._ingress_port = _held_port
+_failing._ingress_candidates = lambda: [_held_port]
+
+_real = adapter.FamiliarAdapter(config(url=URL, token="tok_header"))
+_real._ingress_port = _free_port
+_real._ingress_candidates = lambda: [_free_port]
+
+async def _ingress_lifecycle():
+    """One event loop for the whole lifecycle: a runner belongs to the loop that made it.
+
+    Binding in one `asyncio.run` and tearing down in another leaves aiohttp holding a proactor from a closed loop -
+    a property of this harness, not of the plugin, which does both inside the gateway's single loop.
+    """
+    failed_up = await _failing._open_ingress(_aiohttp_web)
+    came_up = await _real._open_ingress(_aiohttp_web)
+    while_up = dict(_real._channel_headers("tok_header"))
+    await _real.disconnect()
+
+    return failed_up, came_up, while_up, dict(_real._channel_headers("tok_header"))
+
+
+_failed_up, _came_up, _while_up, _after_down = asyncio.run(_ingress_lifecycle())
+
+check(
+    "a bind that FAILED is reported as a failure, not as a machine that came up",
+    _failed_up is False,
+    str(_failed_up),
+)
+check(
+    "and that machine announces NO port, because the one it tried is not one anything answers on",
+    "X-Familiar-Ingress" not in _failing._channel_headers("tok_header"),
+    str(_failing._channel_headers("tok_header")),
+)
+check(
+    "while it still names its build, so the machine is not silent about itself either",
+    _failing._channel_headers("tok_header").get("X-Familiar-Plugin") == adapter.PLUGIN_VERSION,
+    str(_failing._channel_headers("tok_header").get("X-Familiar-Plugin")),
+)
+check(
+    "and a bind that WORKED announces the port it really took",
+    _came_up is True and _while_up.get("X-Familiar-Ingress") == str(_free_port),
+    f"up={_came_up} {_while_up}",
+)
+check(
+    "and tearing the listener down stops the port being announced, which is the same fact read the other way",
+    "X-Familiar-Ingress" not in _after_down,
+    str(_after_down),
+)
+
+_holder.close()
+
 # The two settings a machine remembers live in ONE file, so neither writer may drop the other's half.
 adapter._save_token(URL, "tok_two_sections")
 adapter._save_ingress_port("sections", 9999)
