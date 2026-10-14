@@ -1,7 +1,7 @@
 name: familiar-platform
 label: Familiar
 kind: platform
-version: 2.13.0
+version: 2.14.0
 description: >
   The channel a Familiar client reaches a Hermes machine through: the machine dials out and holds one
   connection, and messages, asks and reads all travel over it.
@@ -10,6 +10,10 @@ description: >
   one entry per Familiar it talks to. So a machine pairing once is what several profiles share, each reporting
   its own name, and prod and dev are two entries rather than one overwriting the other. A file written when the
   state was per-profile, or before a machine could hold two, is folded in on read rather than re-paired.
+
+  The ingress is per PROFILE, because a machine runs one gateway per profile and they are separate processes:
+  each profile takes its own loopback port and remembers it, so two profiles can run at once and a reader's
+  pairing-code address does not move. FAMILIAR_INGRESS_PORT still means exactly that port.
 
   A cron job's output is pushed, never read: the instance's Jobs API carries status alone, so a job that
   ran looks identical to one whose words nobody can reach. Registering a platform with a cron delivery

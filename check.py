@@ -238,6 +238,131 @@ finally:
     live._ingress_port = _held_port
 check("a say carrying a message reaches this machine's own ingress", isinstance(_said, dict), str(_said))
 check("connect() reports ready", asyncio.run(live.connect()) is True)
+
+# 2d. The ingress port is per PROFILE, because a machine runs one gateway per profile and they are separate
+# processes. One fixed number per machine is what made a second profile impossible: its gateway lost the bind to
+# the first, reported no connected platforms, and retried forever with a growing backoff. Measured shape of it:
+#   [familiar] ingress could not bind 127.0.0.1:8644 - [Errno 98] address already in use
+print("\nthe ingress port, per profile")
+
+
+def _occupy(port: int):
+    """Hold a loopback port the way another profile's gateway holds it."""
+    held = socket.socket()
+    held.bind(("127.0.0.1", port))
+    held.listen(1)
+    return held
+
+
+_profile_key_was = adapter._profile_key
+
+_port_base = _free_port()
+_held_ports = [_occupy(_port_base), _occupy(_port_base + 1)]
+
+
+async def _port_run():
+    """Two profiles on ONE machine, plus an operator who named a port."""
+    # No operator setting: the DEFAULT path, which is the one that has to move past a taken number.
+    first = adapter.FamiliarAdapter(config(url=URL))
+    first._ingress_port_set = False
+    first._ingress_port = _port_base
+    adapter._profile_key = lambda: "alpha"
+    started_first = await first.connect()
+    port_first = first._ingress_port
+
+    second = adapter.FamiliarAdapter(config(url=URL))
+    second._ingress_port_set = False
+    second._ingress_port = _port_base
+    adapter._profile_key = lambda: "beta"
+    started_second = await second.connect()
+    port_second = second._ingress_port
+
+    remembered = (adapter._load_ingress_port("alpha"), adapter._load_ingress_port("beta"))
+
+    # An operator's number is THEIR number: a taken one is reported, never quietly routed around.
+    strict = adapter.FamiliarAdapter(config(url=URL))
+    strict._ingress_port_set = True
+    strict._ingress_port = _port_base
+    started_strict = await strict.connect()
+
+    await strict.disconnect()
+
+    await first.disconnect()
+    await second.disconnect()
+
+    return started_first, port_first, started_second, port_second, remembered, started_strict
+
+
+_sf, _pf, _ss, _ps, _remembered, _strict = asyncio.run(_port_run())
+
+# What this profile took last time is preferred, so the port a reader curls does not move between restarts. Read
+# while the key still says "alpha", and with no operator setting in the environment: a construction under the
+# harness's own FAMILIAR_INGRESS_PORT would be an operator setting, and would answer a different question.
+adapter._profile_key = lambda: "alpha"
+with without_env("FAMILIAR_INGRESS_PORT"):
+    _preferred = adapter.FamiliarAdapter(config(url=URL))._ingress_port
+
+adapter._profile_key = _profile_key_was
+for _s in _held_ports:
+    _s.close()
+
+check(
+    "a profile whose starting port is taken takes the next free one",
+    _sf is True and _pf == _port_base + 2,
+    f"started={_sf} port={_pf} (base {_port_base}, {_port_base} and {_port_base + 1} held)",
+)
+check(
+    "and a SECOND profile on the same machine gets its own instead of failing",
+    _ss is True and _ps != _pf,
+    f"started={_ss} port={_ps} against the first profile's {_pf}",
+)
+check(
+    "so one machine can run two profiles, which one fixed port made impossible",
+    _ps == _port_base + 3,
+    str(_ps),
+)
+check(
+    "and each profile's port is REMEMBERED, so it does not move between restarts",
+    _remembered == (_port_base + 2, _port_base + 3),
+    str(_remembered),
+)
+check(
+    "a remembered port is the one a later run prefers, with no operator setting in the way",
+    _preferred == _port_base + 2,
+    f"preferred {_preferred}",
+)
+check(
+    "an operator's own setting is honoured exactly: a taken port fails rather than moving",
+    _strict is False,
+    str(_strict),
+)
+
+# The two settings a machine remembers live in ONE file, so neither writer may drop the other's half.
+adapter._save_token(URL, "tok_two_sections")
+adapter._save_ingress_port("sections", 9999)
+check(
+    "saving a port does not drop the pairings beside it",
+    adapter._load_token(URL) == "tok_two_sections",
+    adapter._load_token(URL),
+)
+adapter._save_token(URL, "tok_two_sections_again")
+check(
+    "and saving a pairing does not drop the port beside it",
+    adapter._load_ingress_port("sections") == 9999,
+    str(adapter._load_ingress_port("sections")),
+)
+adapter._clear_token(URL)
+
+# The candidate list is the whole contract, and it has two shapes.
+_probe = adapter.FamiliarAdapter(config(url=URL))
+_probe._ingress_port, _probe._ingress_port_set = 9000, True
+check("an operator's port is the only candidate there is", _probe._ingress_candidates() == [9000], str(_probe._ingress_candidates()))
+_probe._ingress_port_set = False
+check(
+    "and the default starts a span, which is what lets a second profile exist",
+    _probe._ingress_candidates()[:2] == [9000, 9001] and len(_probe._ingress_candidates()) == adapter.INGRESS_PORT_SPAN,
+    str(_probe._ingress_candidates()[:3]),
+)
 check("home target defaults to 'default'", live._home == "default")
 with without_env("FAMILIAR_TOKEN"):
     # The channel is the direction that needs NOTHING on this machine: it dials out. So an unpaired machine still

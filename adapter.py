@@ -169,6 +169,27 @@ def _state_path() -> Path:
 	return path
 
 
+def _profile_key() -> str:
+	"""This profile's identity: its own directory name, or ``default`` for the machine's own home.
+
+	Asked of the paths rather than of ``FAMILIAR_INSTANCE``: the label is a thing a reader RENAMES, and a renamed
+	label must not move the port this profile keeps.
+	"""
+	try:
+		from hermes_constants import get_hermes_home
+
+		home = Path(get_hermes_home()).resolve()
+	except Exception:  # noqa: BLE001 - an import that fails still has a machine to answer for
+		return DEFAULT_TARGET
+
+	try:
+		root = _state_home().parent.resolve()
+	except Exception:  # noqa: BLE001
+		return DEFAULT_TARGET
+
+	return DEFAULT_TARGET if home == root else home.name
+
+
 def _backend_key(url: str) -> str:
 	"""What one Familiar deployment is keyed by: where it answers.
 
@@ -274,14 +295,56 @@ def _load_pairings(url: str) -> Dict[str, Any]:
 	return _migrate(_read_raw(), url)
 
 
-def _save_pairings(pairings: Dict[str, Any]) -> None:
-	"""Write the machine's pairings, each under the backend it belongs to."""
+def _write_state(**sections: Any) -> None:
+	"""Write sections into the machine's one state file, leaving every OTHER section exactly where it is.
+
+	One file holds more than one concern - the pairings, and the loopback port each profile took - so a writer that
+	laid down only the half it was holding would drop the other half. The flat keys of a file written before a
+	machine could hold two pairings are dropped here: the caller has already folded them into ``pairings``, and
+	leaving them beside the map they became would resurrect them on the next read.
+	"""
+	state = _read_raw()
+	state.update(sections)
+	state.pop("token", None)
+	state.pop("refused", None)
+
 	try:
 		path = _state_path()
 		path.parent.mkdir(parents=True, exist_ok=True)
-		path.write_text(json.dumps({"pairings": pairings}, indent="\t"), encoding="utf-8")
+		path.write_text(json.dumps(state, indent="\t"), encoding="utf-8")
 	except Exception as error:  # noqa: BLE001 - state that will not persist is worth a warning, not a crash
-		logger.warning("[familiar] could not save this machine's pairings: %s", error)
+		logger.warning("[familiar] could not save this machine's state: %s", error)
+
+
+def _save_pairings(pairings: Dict[str, Any]) -> None:
+	"""Write the machine's pairings, each under the backend it belongs to."""
+	_write_state(pairings=pairings)
+
+
+def _load_ingress_port(profile: str) -> Optional[int]:
+	"""The loopback port this profile took last time, or None if it never took one."""
+	ports = _read_raw().get("ingress")
+
+	if not isinstance(ports, dict):
+		return None
+
+	try:
+		return int(ports[profile])
+	except (KeyError, TypeError, ValueError):
+		return None
+
+
+def _save_ingress_port(profile: str, port: int) -> None:
+	"""Remember which loopback port this profile took.
+
+	Without it the port is decided by whichever gateway happens to start first, so two profiles can swap ports
+	across a reboot - and the one place a person reads a pairing code would move out from under them. Recorded,
+	it is stable: a profile keeps the port it has, and only takes another when that one is genuinely gone.
+	"""
+	ports = _read_raw().get("ingress")
+	ports = dict(ports) if isinstance(ports, dict) else {}
+	ports[profile] = int(port)
+	_write_state(ingress=ports)
 
 
 def _entry_for(url: str) -> Dict[str, Any]:
@@ -398,6 +461,10 @@ INGRESS_PATH = "/familiar/ingress"
 #: The port this adapter listens on inside the instance. The api_server holds 8642 and the dashboard
 #: 8080, so the channel takes the next one.
 DEFAULT_INGRESS_PORT = 8644
+#: How far the search for a port this profile can actually have goes past the starting one. A machine runs one
+#: ingress per PROFILE, so two profiles must not have to agree on a number - the second one simply moves past
+#: the first. The span only has to outlast the number of profiles a machine really runs.
+INGRESS_PORT_SPAN = 64
 
 """
 What one delivery carries before it is cut.
@@ -725,8 +792,26 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		self._instance: str = _instance_name(extra)
 		self._ingress_token: str = _setting(extra, "ingress_token", "FAMILIAR_INGRESS_TOKEN", self._token)
 		self._ingress_host: str = _setting(extra, "ingress_host", "FAMILIAR_INGRESS_HOST", "127.0.0.1")
-		self._ingress_port: int = int(
-			_setting(extra, "ingress_port", "FAMILIAR_INGRESS_PORT", str(DEFAULT_INGRESS_PORT)) or DEFAULT_INGRESS_PORT)
+		# An operator's own setting means exactly that port, and a taken one is theirs to see and fix. The DEFAULT
+		# is only a starting point instead: a machine runs one ingress PER PROFILE, so the second profile's gateway
+		# must not lose a race for a number it can simply move past. What this profile took last time wins over the
+		# default, so the one place a person reads a pairing code does not move between restarts.
+		configured_port = str(_setting(extra, "ingress_port", "FAMILIAR_INGRESS_PORT", "") or "").strip()
+		self._ingress_port_set = bool(configured_port)
+
+		if self._ingress_port_set:
+			try:
+				self._ingress_port = int(configured_port)
+			except ValueError:
+				logger.warning(
+					"[familiar] FAMILIAR_INGRESS_PORT is not a port number (%r); starting from %s instead",
+					configured_port, DEFAULT_INGRESS_PORT,
+				)
+				self._ingress_port_set = False
+
+		if not self._ingress_port_set:
+			self._ingress_port = _load_ingress_port(_profile_key()) or DEFAULT_INGRESS_PORT
+
 		self._ingress_runner: Optional[Any] = None
 		# chat id -> the session key that conversation is routed by. The routing entry is the only thing that
 		# knows which SESSION an address is on, and it is the gateway's, so it has to be asked per reply rather
@@ -826,6 +911,33 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		from aiohttp import web
 
+		if not await self._open_ingress(web):
+			return False
+
+		self._mark_connected()
+
+		return True
+
+	def _ingress_candidates(self) -> List[int]:
+		"""Every loopback port this adapter will try, in order.
+
+		ONE entry when an operator set the port: their number means their number, and a taken one is a fact they
+		asked to be told about rather than something to route around behind their back. Otherwise the starting port
+		and the span above it - which is what lets a second profile exist at all.
+		"""
+		if self._ingress_port_set:
+			return [self._ingress_port]
+
+		return [self._ingress_port + step for step in range(INGRESS_PORT_SPAN)]
+
+	async def _open_ingress(self, web: Any) -> bool:
+		"""Bind the ingress on a port THIS profile can have, and remember which one that was.
+
+		A machine runs several profiles, each with its own gateway, so the familiar ingress is per profile rather
+		than per machine. Losing the bind is therefore not a failure to report but a number to move past - the one
+		thing that must not happen is two profiles silently fighting over 8644, which is what `address already in
+		use` looks like from outside while the gateway reports no connected platforms and retries forever.
+		"""
 		app = web.Application()
 		app.router.add_post(INGRESS_PATH, self._handle_ingress)
 		app.router.add_get(INGRESS_PATH, self._handle_ingress_probe)
@@ -834,19 +946,36 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		runner = web.AppRunner(app, access_log=None)
 		await runner.setup()
-		site = web.TCPSite(runner, self._ingress_host, self._ingress_port)
-		try:
-			await site.start()
-		except OSError as error:
-			logger.error("[familiar] ingress could not bind %s:%s - %s", self._ingress_host, self._ingress_port, error)
-			return False
 
-		self._ingress_runner = runner
-		logger.info("[familiar] ingress listening on http://%s:%s%s", self._ingress_host, self._ingress_port, INGRESS_PATH)
+		refused: Optional[Exception] = None
 
-		self._mark_connected()
+		for candidate in self._ingress_candidates():
+			site = web.TCPSite(runner, self._ingress_host, candidate)
 
-		return True
+			try:
+				await site.start()
+			except OSError as error:
+				refused = error
+				continue
+
+			if candidate != self._ingress_port:
+				logger.info(
+					"[familiar] %s was taken on %s; this profile's ingress takes %s",
+					self._ingress_port, self._ingress_host, candidate,
+				)
+
+			self._ingress_port = candidate
+			self._ingress_runner = runner
+			_save_ingress_port(_profile_key(), candidate)
+
+			logger.info("[familiar] ingress listening on http://%s:%s%s", self._ingress_host, candidate, INGRESS_PATH)
+
+			return True
+
+		logger.error("[familiar] ingress could not bind %s:%s - %s", self._ingress_host, self._ingress_port, refused)
+		await runner.cleanup()
+
+		return False
 
 	async def _machine_name(self) -> str:
 		"""What this machine calls itself when it pairs. The instance is named this until somebody renames it."""
