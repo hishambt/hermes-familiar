@@ -1945,6 +1945,135 @@ check(
     repr(live._ingress_token),
 )
 
+# 8. Putting this channel on ANOTHER profile of this machine. One action, because a profile without the plugin has no
+# channel at all, and a machine with several profiles should not need a reader installing it once per profile by hand.
+print("\nactivating another profile")
+_ran: list = []
+_provenance_was = adapter._install_provenance
+_run_was = adapter._run_hermes
+
+
+def _stub_run(argv, timeout=300):
+    """What Hermes' command line would have been given, recorded instead of run."""
+    _ran.append((list(argv), timeout))
+
+    return (0, "✓ Installed\n✓ Plugin familiar-platform enabled.") if "install" in argv else (0, "Plugin Doctor: OK")
+
+
+async def _activate_runs():
+    adapter._install_provenance = lambda: ("https://github.com/hishambt/hermes-familiar.git", "a" * 40)
+    adapter._run_hermes = _stub_run
+
+    named = await live._channel_activate({"profile": "coder"})
+    ran = list(_ran)
+    _ran.clear()
+
+    # A doctor that says ERROR is a plugin that did not register, and a job pointed at that profile would find out
+    # later as a delivery that never arrives.
+    adapter._run_hermes = lambda argv, timeout=300: (
+        (0, "Plugin Doctor: ERROR: Plugin registration failed") if "doctor" in argv else (0, "")
+    )
+    unregistered = await live._channel_activate({"profile": "coder"})
+    adapter._run_hermes = _stub_run
+
+    return named, ran, unregistered
+
+
+_named, _ran, _unregistered = asyncio.run(_activate_runs())
+adapter._install_provenance = _provenance_was
+adapter._run_hermes = _run_was
+
+_install_argv = next((argv for argv, _ in _ran if "install" in argv), [])
+_doctor_argv = next((argv for argv, _ in _ran if "doctor" in argv), [])
+
+check(
+    "activating a profile names WHICH profile, on Hermes' own command line",
+    "-p" in _install_argv and _install_argv[_install_argv.index("-p") + 1] == "coder",
+    str(_install_argv),
+)
+check(
+    "and installs this very build, by source and commit, rather than whatever the branch is now",
+    "https://github.com/hishambt/hermes-familiar.git" in _install_argv
+    and "a" * 40 in _install_argv
+    and "--enable" in _install_argv
+    and "--force" in _install_argv,
+    str(_install_argv),
+)
+check(
+    "and it is Hermes' own INSTALLER that runs, not a copy of these files",
+    _install_argv[:3] == ["-p", "coder", "plugins"] and "install" in _install_argv,
+    str(_install_argv[:4]),
+)
+
+# Where the interpreter and the module come from, with the spawn stubbed: `sys.executable -m hermes_cli.main` and
+# never a `hermes` from PATH, which may be a profile's own wrapper - the class of mistake this action exists to avoid.
+import types  # noqa: E402 - a script, and this belongs with the check that uses it
+
+_spawned: list = []
+_spawn_was = adapter.subprocess.run
+
+
+def _stub_spawn(argv, **kwargs):
+    _spawned.append((list(argv), kwargs))
+
+    return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+
+adapter.subprocess.run = _stub_spawn
+try:
+    adapter._run_hermes(["-p", "coder", "plugins", "list"])
+finally:
+    adapter.subprocess.run = _spawn_was
+
+check(
+    "and it is THIS interpreter that runs it, addressed as a module rather than a `hermes` from PATH",
+    bool(_spawned) and _spawned[0][0][:4] == [sys.executable, "-m", "hermes_cli.main", "-p"],
+    str(_spawned[0][0][:4]) if _spawned else "(nothing was spawned)",
+)
+check(
+    "with stdin closed, so a command that asks a question is refused instead of dying on the timeout",
+    bool(_spawned) and _spawned[0][1].get("stdin") == adapter.subprocess.DEVNULL,
+    str(_spawned[0][1]) if _spawned else "(nothing was spawned)",
+)
+check(
+    "and the machine's own doctor is asked about it before the answer says it worked",
+    _doctor_argv[_doctor_argv.index("-p") + 1] == "coder" and adapter.PLUGIN_NAME in _doctor_argv,
+    str(_doctor_argv),
+)
+check(
+    "the answer carries the profile, the build, and whether the plugin registered there",
+    _named.get("profile") == "coder" and _named.get("installed") == "a" * 40 and _named.get("registered") is True,
+    str(_named),
+)
+check(
+    "and a doctor that reports an error is NOT reported as registered",
+    _unregistered.get("registered") is False,
+    str(_unregistered),
+)
+
+# The refusals, each of which happens before anything is run at all.
+check(
+    "activating with no profile named is refused, and says so",
+    asyncio.run(live._channel_activate({})) == {"error": "no profile named"},
+    str(asyncio.run(live._channel_activate({}))),
+)
+check(
+    "and activating the profile this is ALREADY running as is refused rather than reinstalling over itself",
+    "already here" in str(asyncio.run(live._channel_activate({"profile": adapter._profile_key()}))),
+    str(asyncio.run(live._channel_activate({"profile": adapter._profile_key()}))),
+)
+
+# An install with nothing recorded about where it came from has no build to put anywhere, and this is the shape an
+# install that was copied onto a machine by hand has - so it is told to reinstall rather than installing nonsense.
+adapter._install_provenance = lambda: ("", "")
+_nothing = asyncio.run(live._channel_activate({"profile": "coder"}))
+adapter._install_provenance = _provenance_was
+check(
+    "and an install with no recorded source is refused, with the way out in the sentence",
+    "no recorded source" in str(_nothing.get("error")),
+    str(_nothing),
+)
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")

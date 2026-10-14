@@ -41,6 +41,8 @@ import json
 import logging
 import os
 import re
+import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -84,8 +86,13 @@ STATE_FILE = "state.json"
 #: leave the entry behind and the machine would never read as unpaired again.
 PAIRING_KEYS = ("token", "refused")
 
-#: The directory this plugin keeps that state in, under Hermes' home rather than inside the plugin.
+#: The directory this plugin keeps that state in, under Hermes' home rather than inside the plugin. It coincides
+#: with the install name and is a separate fact on purpose: one is where state lives, the other is what
+#: `plugins install|enable|doctor` call the plugin.
 STATE_DIR = "familiar-platform"
+
+#: What Hermes knows this plugin as: its directory name, and what `plugins.enabled` lists.
+PLUGIN_NAME = "familiar-platform"
 
 #: A connection that drops is retried: the far end restarting is not a reason to give up. Backing off, because a
 #: machine that reconnects in a tight loop is a machine nobody can use.
@@ -337,6 +344,64 @@ def _write_state(**sections: Any) -> None:
 def _save_pairings(pairings: Dict[str, Any]) -> None:
 	"""Write the machine's pairings, each under the backend it belongs to."""
 	_write_state(pairings=pairings)
+
+
+def _install_provenance() -> "tuple[str, str]":
+	"""This copy's own source and revision, from the metadata Hermes writes when it installs a plugin.
+
+	Read from THIS plugin directory's neighbour rather than from the machine root: the root's `plugins/` belongs to
+	whichever profile is the default, and the build to put on another profile is the one running HERE. A machine with
+	two builds of one channel would be worse than a profile with none.
+	"""
+	try:
+		metadata = json.loads(
+			(Path(__file__).resolve().parent.parent / ".install-metadata.json").read_text(encoding="utf-8"))
+	except Exception:  # noqa: BLE001 - an install with no record simply has nothing to copy elsewhere
+		return "", ""
+
+	entry = metadata.get(PLUGIN_NAME) if isinstance(metadata, dict) else None
+	entry = entry if isinstance(entry, dict) else {}
+
+	return str(entry.get("source") or ""), str(entry.get("revision") or "")
+
+
+def _run_hermes(argv: List[str], timeout: int = 300) -> "tuple[int, str]":
+	"""Run Hermes' own command line and read what it said, both streams together.
+
+	`sys.executable -m hermes_cli.main` rather than a `hermes` on PATH: this call comes from inside a running gateway,
+	so the interpreter is known and is the one whose Hermes this is - while PATH may hold a profile's own wrapper,
+	which is the whole class of mistake this action exists to avoid.
+
+	stdin is CLOSED, so a command that asks a question is refused instead of waiting for an answer that can never
+	arrive and dying on the timeout - an installer with nobody at the terminal has nobody to answer it.
+	"""
+	try:
+		done = subprocess.run(
+			[sys.executable, "-m", "hermes_cli.main", *argv],
+			capture_output=True,
+			text=True,
+			timeout=timeout,
+			stdin=subprocess.DEVNULL,
+		)
+	except Exception as error:  # noqa: BLE001 - a command that could not run is an answer too
+		return 1, str(error)
+
+	return done.returncode, (done.stdout or "") + (done.stderr or "")
+
+
+def _answer_line(output: str) -> str:
+	"""The line of a command's output that explains what happened: what it labelled an error, else its last word.
+
+	Not the first line and not the whole dump: an installer prints progress and warnings before anything matters, and
+	whoever reads this answer wants the reason in one sentence.
+	"""
+	lines = [line.strip() for line in (output or "").splitlines() if line.strip()]
+
+	for line in lines:
+		if "error:" in line.lower():
+			return line
+
+	return lines[-1] if lines else ""
 
 
 def _load_ingress_port(profile: str) -> Optional[int]:
@@ -1071,6 +1136,56 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			"Accept": "text/event-stream",
 			"X-Familiar-Plugin": PLUGIN_VERSION,
 			"X-Familiar-Ingress": str(self._ingress_port),
+		}
+
+	async def _channel_activate(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+		"""Put this channel on ANOTHER profile of this machine, in one step.
+
+		A machine runs one gateway per profile and the plugin is found in the home it runs in, so a profile without one
+		has no channel at all - and until now that meant installing the plugin once per profile, by hand, on every
+		machine. This is that step, asked down the connection the machine already holds.
+
+		Hermes' own installer runs rather than a copy of these files. A copy would have none of what an installed
+		plugin has - the entry `plugins list` reads, the metadata an update needs, a doctor that answers - and
+		removing one RAISES instead of removing it (measured: `shutil.rmtree` refuses a linked directory, so the
+		plugin would be stuck there for good). The installer costs a copy of under a megabyte, and it keeps every
+		profile's install a first-class one.
+		"""
+		profile = str(frame.get("profile") or "").strip()
+
+		if not profile:
+			return {"error": "no profile named"}
+
+		if profile == _profile_key():
+			return {"error": "that is this profile: the channel is already here"}
+
+		source, revision = _install_provenance()
+
+		if not source or not revision:
+			return {
+				"error": (
+					"this install has no recorded source and revision, so there is no build to put elsewhere - "
+					"install it from its repository first"
+				)
+			}
+
+		code, output = await asyncio.to_thread(
+			_run_hermes,
+			["-p", profile, "plugins", "install", source, "--ref", revision, "--enable", "--force"],
+		)
+
+		if code != 0:
+			return {"error": _answer_line(output) or f"the installer exited {code}"}
+
+		doctor_code, doctor_output = await asyncio.to_thread(
+			_run_hermes, ["-p", profile, "plugins", "doctor", PLUGIN_NAME], 120)
+
+		return {
+			"profile": profile,
+			"installed": revision,
+			# A registration that did not happen is what a job pointed at that profile discovers LATER, as a
+			# delivery that never arrives - so the machine's own verdict on it travels with the answer.
+			"registered": doctor_code == 0 and "ERROR" not in doctor_output.upper(),
 		}
 
 	async def _hold_channel(self, token: str) -> None:
