@@ -1,10 +1,15 @@
 name: familiar-platform
 label: Familiar
 kind: platform
-version: 2.12.3
+version: 2.13.0
 description: >
   The channel a Familiar client reaches a Hermes machine through: the machine dials out and holds one
   connection, and messages, asks and reads all travel over it.
+
+  Pairing is the MACHINE's, not a profile's: the state sits at Hermes' root, above every profile, and holds
+  one entry per Familiar it talks to. So a machine pairing once is what several profiles share, each reporting
+  its own name, and prod and dev are two entries rather than one overwriting the other. A file written when the
+  state was per-profile, or before a machine could hold two, is folded in on read rather than re-paired.
 
   A cron job's output is pushed, never read: the instance's Jobs API carries status alone, so a job that
   ran looks identical to one whose words nobody can reach. Registering a platform with a cron delivery

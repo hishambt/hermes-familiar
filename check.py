@@ -307,13 +307,13 @@ with without_env("FAMILIAR_TOKEN"):
 # REMEMBERED against it. That is what makes "the instance was deleted, now connect it again" work at all: without
 # it the machine offers the same dead token forever, reports itself paired, and shows no code for anyone to type.
 print("\nthe token a machine presents")
-adapter._clear_token()  # a machine that has not paired
+live._clear_token()  # a machine that has not paired
 check(
     "a configured token is offered while nothing is paired",
     live._presented_token() == "tok_abc123",
     live._presented_token(),
 )
-adapter._mark_refused("tok_abc123")
+adapter._mark_refused(live._url, "tok_abc123")
 check(
     "once Familiar refuses it, it is not offered again, so the machine pairs",
     live._presented_token() == "",
@@ -321,14 +321,83 @@ check(
 )
 probe = json.loads(asyncio.run(live._handle_pair_probe(None)).text)
 check("and the pair endpoint stops claiming to be paired", probe["paired"] is False, str(probe))
-adapter._save_token("a-token-from-pairing")
+adapter._save_token(live._url, "a-token-from-pairing")
 check(
     "a token from pairing wins over the configured one",
     live._presented_token() == "a-token-from-pairing",
     live._presented_token(),
 )
-adapter._clear_token()
+live._clear_token()
 check("and the check leaves no pairing behind", not adapter._state_path().exists())
+
+# 2c. One entry per BACKEND. A machine pairs with an ADDRESS, so two Familiars are two entries - and forgetting one
+# is no reason for the other to lose its token. Before this the file held ONE token, so a machine wired to prod and
+# dev kept whichever wrote last, and the other silently stopped being paired.
+print("\ntwo Familiars on one machine")
+other = "http://dev.familiar.test:3100"
+adapter._save_token(live._url, "tok_for_prod")
+adapter._save_token(other, "tok_for_dev")
+check(
+    "each backend keeps its own token",
+    adapter._load_token(live._url) == "tok_for_prod" and adapter._load_token(other) == "tok_for_dev",
+    f"prod={adapter._load_token(live._url)!r} dev={adapter._load_token(other)!r}",
+)
+check(
+    "and the file holds both, keyed by where each one answers",
+    sorted(adapter._load_pairings(live._url)) == sorted([live._url.rstrip("/"), other]),
+    str(sorted(adapter._load_pairings(live._url))),
+)
+adapter._clear_token(other)
+check(
+    "forgetting one leaves the other paired",
+    adapter._load_token(live._url) == "tok_for_prod" and adapter._load_token(other) == "",
+    f"prod={adapter._load_token(live._url)!r} dev={adapter._load_token(other)!r}",
+)
+# A file written before a machine could hold more than one pairing: one flat token and no map. It belongs to the
+# backend ASKING for it, which is the only one such an install has ever spoken to - so it is read, and the first
+# write turns the file into a map rather than throwing the token away.
+adapter._state_path().write_text(json.dumps({"token": "tok_flat"}), encoding="utf-8")
+check(
+    "a file from before a machine could hold two is read as the asking backend's token",
+    adapter._load_token(live._url) == "tok_flat",
+    adapter._load_token(live._url),
+)
+adapter._save_token(other, "tok_for_dev")
+check(
+    "and the first write turns it into a map, under the backend that wrote",
+    (json.loads(adapter._state_path().read_text(encoding="utf-8")).get("pairings") or {}).get(other, {}).get("token")
+    == "tok_for_dev",
+    adapter._state_path().read_text(encoding="utf-8"),
+)
+live._clear_token()
+adapter._clear_token(other)
+check("and the check leaves the machine unpaired again", not adapter._state_path().exists())
+
+# A machine that paired while pairing was PER PROFILE: the token is under that profile's own home, and the machine
+# root adopts it. Making it pair again because the plugin changed its mind about where state lives would be a step
+# the reader did nothing to lose.
+with tempfile.TemporaryDirectory() as profile_root:
+    profile_home = Path(profile_root) / "profiles" / "coder"
+    (profile_home / adapter.STATE_DIR).mkdir(parents=True)
+    (profile_home / adapter.STATE_DIR / adapter.STATE_FILE).write_text(
+        json.dumps({"token": "tok_from_a_profile"}), encoding="utf-8")
+
+    _home_was = os.environ["HERMES_HOME"]
+    os.environ["HERMES_HOME"] = str(profile_home)
+    try:
+        adopted = adapter._load_token("http://prod.familiar.test:3100")
+        machine_file = adapter._state_path().resolve()
+        retired = not (profile_home / adapter.STATE_DIR / adapter.STATE_FILE).exists()
+    finally:
+        os.environ["HERMES_HOME"] = _home_was
+
+    check("a profile's own pairing is adopted rather than lost", adopted == "tok_from_a_profile", adopted)
+    check(
+        "and it is the MACHINE's file that holds it, above every profile",
+        machine_file == (Path(profile_root) / adapter.STATE_DIR / adapter.STATE_FILE).resolve(),
+        str(machine_file),
+    )
+    check("and the profile's own file is retired, so it cannot be adopted a second time", retired)
 
 # The token has to survive an UPDATE, and an update is `plugins install --force`: it removes this plugin's whole
 # directory and lays a new one down. Beside the plugin is therefore the one place this state cannot live.
@@ -349,7 +418,7 @@ with tempfile.TemporaryDirectory() as legacy_where:
     Path(adapter.__file__).write_text("", encoding="utf-8")
     (Path(legacy_where) / adapter.STATE_FILE).write_text(json.dumps({"token": "tok_legacy"}), encoding="utf-8")
 
-    adopted = adapter._load_token()
+    adopted = adapter._load_token(live._url)
     # Where the plugin SAYS its state is, rather than recomputing it from the environment: the home is resolved once
     # at import, so a check that recomputed it would be checking something the plugin never looks at.
     where_now = adapter._state_path().resolve()
@@ -1660,7 +1729,7 @@ check(
 )
 
 # 7. Unpairing: Familiar lets this machine go. The CREDENTIAL is what disappears, not the address.
-adapter._save_token("tok_paired_here")
+adapter._save_token(live._url, "tok_paired_here")
 live._take_token("tok_paired_here")
 
 _was = live._url
@@ -1680,8 +1749,8 @@ check(
 )
 check(
     "and the machine FORGETS the token, which is the whole pairing",
-    adapter._load_token() == "" and live._token == "",
-    f"stored={adapter._load_token()!r} held={live._token!r}",
+    adapter._load_token(live._url) == "" and live._token == "",
+    f"stored={adapter._load_token(live._url)!r} held={live._token!r}",
 )
 check(
     "and keeps the address, so wiring it again is one code and nothing else",

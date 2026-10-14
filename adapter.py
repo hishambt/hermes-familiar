@@ -101,12 +101,28 @@ PAIR_PATH = "/familiar/pair"
 
 
 def _state_home() -> Path:
-	"""Hermes' own home, which is where a plugin's state belongs.
+	"""The MACHINE's Hermes root, which is where a plugin's state belongs.
 
-	Asked of Hermes rather than read off the environment: the home is profile-aware, so a machine running two profiles
-	keeps two pairings, which is what having two profiles means. The env var is the fallback for an older Hermes that
-	does not offer the function - it is where that home lives anyway.
+	A pairing is with a machine, not with a profile: a profile is a dimension OF a paired machine. So this state sits
+	above every profile - a named profile's home and the default home resolve to the same root - and every profile's
+	gateway reads the one file. What a profile contributes is what the machine REPORTS (`FAMILIAR_INSTANCE`), never
+	what it pairs as.
+
+	Per-profile was the earlier reading, and it is the one that reads as obvious from inside a profile: a machine
+	running two profiles kept two pairings. That made pairing a per-agent act and left a reader with one machine
+	listed twice. One pairing, several profiles.
+
+	Asked of Hermes rather than read off the environment. An older Hermes with no `get_default_hermes_root` falls
+	back to the profile's own home, which is where it paired before: a machine must not lose its pairing to a
+	version bump.
 	"""
+	try:
+		from hermes_constants import get_default_hermes_root
+
+		return Path(get_default_hermes_root()) / STATE_DIR
+	except Exception:  # noqa: BLE001 - a pairing is worth a fallback, never a crash
+		pass
+
 	try:
 		from hermes_constants import get_hermes_home
 
@@ -153,23 +169,165 @@ def _state_path() -> Path:
 	return path
 
 
-def _load_token() -> str:
-	"""The token this machine was given when it was paired, or an empty string."""
+def _backend_key(url: str) -> str:
+	"""What one Familiar deployment is keyed by: where it answers.
+
+	The URL is the identity because it is the one thing that tells two Familiars apart before either has issued a
+	token - a machine pairs with an ADDRESS, and a token is what that address handed back. Prod and dev are two keys.
+	The trailing slash goes, so the same Familiar written two ways stays one key.
+	"""
+	return str(url or "").strip().rstrip("/")
+
+
+def _read_raw() -> Dict[str, Any]:
+	"""The state file exactly as written; missing or unreadable reads as empty."""
 	try:
-		return str(json.loads(_state_path().read_text(encoding="utf-8")).get("token") or "")
-	except Exception:  # noqa: BLE001 - no state, unreadable state: both mean "not paired yet"
-		return ""
+		raw = json.loads(_state_path().read_text(encoding="utf-8")) or {}
+	except Exception:  # noqa: BLE001 - no state, unreadable state: both mean "nothing paired yet"
+		return {}
+
+	return raw if isinstance(raw, dict) else {}
 
 
-def _save_token(token: str) -> None:
-	"""Keep the token across restarts. A machine that has to pair again after every restart is not paired."""
+def _profile_pairing() -> Dict[str, Any]:
+	"""A pairing kept under the PROFILE's own home, from when a machine paired per profile.
+
+	That reading is gone - a profile is a dimension of a paired machine - so this file is folded into the machine's
+	map once and retired, or a machine that already paired would pair again to no purpose.
+	"""
 	try:
-		_state_path().write_text(json.dumps({"token": token}, indent="\t"), encoding="utf-8")
-	except Exception as error:  # noqa: BLE001 - a token that will not persist is worth a warning, not a crash
-		logger.warning("[familiar] could not save this machine's pairing: %s", error)
+		from hermes_constants import get_hermes_home
+
+		legacy = Path(get_hermes_home()) / STATE_DIR / STATE_FILE
+	except Exception:  # noqa: BLE001
+		return {}
+
+	if not legacy.exists():
+		return {}
+
+	try:
+		if legacy.resolve() == _state_path().resolve():
+			return {}  # the default home IS the machine root, so there is nothing to adopt
+	except OSError:
+		return {}
+
+	try:
+		raw = json.loads(legacy.read_text(encoding="utf-8")) or {}
+	except Exception:  # noqa: BLE001
+		return {}
+
+	if not isinstance(raw, dict):
+		return {}
+
+	nested = raw.get("pairings")
+
+	if isinstance(nested, dict) and len(nested) == 1:
+		only = next(iter(nested.values()))
+
+		return dict(only) if isinstance(only, dict) else {}
+
+	if raw.get("token") or raw.get("refused"):
+		return dict(raw)
+
+	return {}
 
 
-def _clear_token() -> None:
+def _retire_profile_state() -> None:
+	"""Drop a profile's own state file once its pairing has been folded into the machine's."""
+	try:
+		from hermes_constants import get_hermes_home
+
+		(Path(get_hermes_home()) / STATE_DIR / STATE_FILE).unlink(missing_ok=True)
+	except Exception as error:  # noqa: BLE001 - an old file that will not go is not worth a failed read
+		logger.warning("[familiar] could not retire this profile's own pairing file: %s", error)
+
+
+def _migrate(raw: Dict[str, Any], url: str) -> Dict[str, Any]:
+	"""Every pairing the machine holds, keyed by backend, with an older file folded in under *url*.
+
+	"Older" is either shape, and both say the same thing - this machine has paired, once, with the Familiar at *url*:
+	a FLAT file (``{"token": ...}``), written when a machine could hold only one pairing; or one written under a
+	PROFILE's own home, from when pairing was per-profile.
+	"""
+	key = _backend_key(url)
+	pairings = raw.get("pairings")
+
+	if isinstance(pairings, dict):
+		out = {str(name): dict(entry) for name, entry in pairings.items() if isinstance(entry, dict)}
+	elif raw.get("token") or raw.get("refused"):
+		out = {key: dict(raw)} if key else {}
+	else:
+		out = {}
+
+	if key and key not in out:
+		orphan = _profile_pairing()
+
+		if orphan:
+			out[key] = orphan
+			_retire_profile_state()
+
+	return out
+
+
+def _load_pairings(url: str) -> Dict[str, Any]:
+	"""Every pairing this machine holds, keyed by the backend that issued it."""
+	return _migrate(_read_raw(), url)
+
+
+def _save_pairings(pairings: Dict[str, Any]) -> None:
+	"""Write the machine's pairings, each under the backend it belongs to."""
+	try:
+		path = _state_path()
+		path.parent.mkdir(parents=True, exist_ok=True)
+		path.write_text(json.dumps({"pairings": pairings}, indent="\t"), encoding="utf-8")
+	except Exception as error:  # noqa: BLE001 - state that will not persist is worth a warning, not a crash
+		logger.warning("[familiar] could not save this machine's pairings: %s", error)
+
+
+def _entry_for(url: str) -> Dict[str, Any]:
+	"""This backend's pairing, or an empty one."""
+	return dict(_load_pairings(url).get(_backend_key(url)) or {})
+
+
+def _load_token(url: str = "") -> str:
+	"""The token this machine was given when it paired with the Familiar at *url*, or an empty string."""
+	return str(_entry_for(url).get("token") or "")
+
+
+def _save_token(url: str, token: str) -> None:
+	"""Keep this backend's token across restarts, leaving every other backend's exactly where it is.
+
+	Two things at once: a machine that has to pair again after every restart is not paired, and a machine talking to
+	two Familiars holds two entries rather than one token overwriting the other.
+	"""
+	key = _backend_key(url)
+	pairings = _load_pairings(url)
+	entry = dict(pairings.get(key) or {})
+	entry["token"] = token
+	# A pairing that succeeds answers any earlier refusal: whatever Familiar turned down is not what this machine
+	# presents now.
+	entry.pop("refused", None)
+	pairings[key] = entry
+	_save_pairings(pairings)
+
+
+def _clear_token(url: str = "") -> None:
+	"""Forget THIS backend's pairing, and only this one. Every other Familiar the machine talks to stays paired."""
+	key = _backend_key(url)
+	pairings = _load_pairings(url)
+	entry = dict(pairings.get(key) or {})
+	entry.pop("token", None)
+
+	if entry:
+		pairings[key] = entry  # a remembered refusal outlives the token it was about
+	else:
+		pairings.pop(key, None)
+
+	if pairings:
+		_save_pairings(pairings)
+
+		return
+
 	try:
 		_state_path().unlink(missing_ok=True)
 	except Exception as error:  # noqa: BLE001
@@ -181,35 +339,31 @@ def _token_hint(token: str) -> str:
 	return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
 
 
-def _load_refused() -> str:
-	"""The token this Familiar has already refused, as its hint, or an empty string.
+def _load_refused(url: str = "") -> str:
+	"""The token the Familiar at *url* has already refused, as its hint, or an empty string.
 
 	Only ever a token that came from OUTSIDE this install - the environment or the config. The one pairing gave
 	us is deleted outright when it stops being accepted, so there is nothing to remember.
 	"""
-	try:
-		return str(json.loads(_state_path().read_text(encoding="utf-8")).get("refused") or "")
-	except Exception:  # noqa: BLE001 - no state, unreadable state: nothing has been refused
-		return ""
+	return str(_entry_for(url).get("refused") or "")
 
 
-def _mark_refused(token: str) -> None:
+def _mark_refused(url: str, token: str) -> None:
 	"""Remember that this machine must stop presenting a token it was configured with.
 
 	The token itself is somebody's deliberate setting and is not this plugin's to erase: what is written down is
 	that presenting it again would fail, scoped to THAT token's hint so a corrected value in the environment is
 	honoured the moment it changes. Without it a machine whose instance was deleted elsewhere retries the same
-	dead token forever - reporting ``paired: true``, showing no code, with no way back from the app.
+	dead token forever - reporting ``paired: true``, showing no code, and with no way back from the app.
 	"""
 	try:
-		state: Dict[str, Any] = {}
-
-		if _state_path().exists():
-			state = json.loads(_state_path().read_text(encoding="utf-8")) or {}
-
-		state["refused"] = _token_hint(token)
-		state.pop("token", None)
-		_state_path().write_text(json.dumps(state, indent="\t"), encoding="utf-8")
+		key = _backend_key(url)
+		pairings = _load_pairings(url)
+		entry = dict(pairings.get(key) or {})
+		entry["refused"] = _token_hint(token)
+		entry.pop("token", None)
+		pairings[key] = entry
+		_save_pairings(pairings)
 	except Exception as error:  # noqa: BLE001 - worth a warning, not a crash
 		logger.warning("[familiar] could not record that a token was refused: %s", error)
 
@@ -542,12 +696,14 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 	MAX_MESSAGE_LENGTH = MAX_MESSAGE_LENGTH
 
-	# The four things this half and the answer half both use, reachable from either as ``self.<name>``: the delivery
-	# POST and the token forgetter are what this side does with a token, and the two paths are what the channel speaks.
-	# Held here as class attributes so neither module has to import the other at module level, which only works in one
-	# load order - and this file is imported both ways, as a package and as a plain module.
+	# The three things this half and the answer half both use, reachable from either as ``self.<name>``: the delivery
+	# POST, what a token is forgotten BY, and the two paths the channel speaks. Held here as class attributes so
+	# neither module has to import the other at module level, which only works in one load order - and this file is
+	# imported both ways, as a package and as a plain module.
+	#
+	# ``_clear_token`` is a METHOD rather than that module function, because forgetting is per BACKEND now: the one
+	# this adapter speaks to, and not every Familiar the machine is paired with.
 	_post = staticmethod(_post)
-	_clear_token = staticmethod(_clear_token)
 	CHANNEL_REPLY_PATH = CHANNEL_REPLY_PATH
 	INGRESS_PATH = INGRESS_PATH
 
@@ -608,12 +764,12 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		not offered again - which is the whole difference between a machine that pairs again and one that sits
 		holding a dead token, showing no code and no way forward.
 		"""
-		stored = _load_token()
+		stored = _load_token(self._url)
 
 		if stored:
 			return stored
 
-		if self._token and _token_hint(self._token) == _load_refused():
+		if self._token and _token_hint(self._token) == _load_refused(self._url):
 			return ""
 
 		return self._token
@@ -631,6 +787,14 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		if not self._ingress_token:
 			self._ingress_token = token
+
+	def _clear_token(self) -> None:
+		"""Forget this backend's pairing - the one this adapter speaks to, and no other.
+
+		Per BACKEND rather than per machine: a machine paired with two Familiars holds two tokens, and forgetting one
+		of them (its instance was deleted there, or the reader unpaired it) must leave the other exactly where it is.
+		"""
+		_clear_token(self._url)
 
 	async def connect(self, *, is_reconnect: bool = False) -> bool:
 		"""Open the ingress: the one route Familiar posts a person's message to.
@@ -750,16 +914,16 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 					# again is the answer, and it has to be reachable from BOTH places a token comes from - otherwise
 					# the machine is stuck, which is what a reader hits who deletes an instance and reconnects to a
 					# machine that still holds its token.
-					stored = _load_token()
+					stored = _load_token(self._url)
 
 					if stored:
 						logger.warning("[familiar] this Familiar no longer accepts this machine's token; pairing again")
-						_clear_token()
-					elif self._token and _token_hint(self._token) != _load_refused():
+						_clear_token(self._url)
+					elif self._token and _token_hint(self._token) != _load_refused(self._url):
 						logger.warning(
 							"[familiar] Familiar does not accept the token this machine was configured with; pairing again"
 						)
-						_mark_refused(self._token)
+						_mark_refused(self._url, self._token)
 
 					raise RuntimeError(f"the channel refused this machine's token (HTTP {response.status})")
 
@@ -864,7 +1028,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 						token = str(paired.get("token") or "")
 
 						if token:
-							_save_token(token)
+							_save_token(self._url, token)
 							self._take_token(token)
 							self._pair_code = ""
 							logger.info("[familiar] paired: this machine is reachable through the channel now")
