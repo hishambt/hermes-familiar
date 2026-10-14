@@ -917,9 +917,20 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		This is the direction that makes Familiar a channel rather than a notifier. The other direction - the
 		notifications and the asks - is outbound HTTP, and needs no listener at all.
 		"""
+		from aiohttp import web
+
+		# The ingress BEFORE the channel, so the port this profile took is settled before anything announces it.
+		# The connection is what carries that port to Familiar, and a connection opened first would carry the
+		# number this profile MEANT to take - which is exactly the number another profile may have got to first.
+		# So the one carrier that always reaches Familiar would name a port nothing here is listening on.
+		ingress_up = await self._open_ingress(web)
+
 		# The CHANNEL is the direction that needs nothing on this machine: it dials out, so a machine that has never
 		# been paired still connects - and connecting is how it pairs. The INGRESS needs a token to authenticate with,
 		# so a machine without one skips it and says why rather than refusing to load at all.
+		#
+		# Started even when the ingress did NOT come up: the channel is what pairs a machine, and a bind that failed
+		# must not also take away the only way to get it fixed.
 		started = False
 
 		if self._url and self._channel_task is None:
@@ -939,9 +950,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			# loopback. The two GETs are loopback-only by design, which is exactly who the code is for.
 			logger.info("[familiar] not paired yet: the channel asks for a code, and its ingress serves it")
 
-		from aiohttp import web
-
-		if not await self._open_ingress(web):
+		if not ingress_up:
 			return False
 
 		self._mark_connected()
@@ -1048,6 +1057,22 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			await asyncio.sleep(delay)
 			delay = min(delay * 2, RECONNECT_MAX_S)
 
+	def _channel_headers(self, token: str) -> Dict[str, str]:
+		"""What this connection says about itself: the build it runs, and the loopback port its ingress took.
+
+		Both travel on EVERY connection rather than only when a machine pairs. The version answers "did the update
+		land?" for a machine set up over its shell, which never pairs at all; the port is what Familiar aims a
+		reader's pairing-code command and its own reachability probe at, and since a machine runs one ingress PER
+		PROFILE it cannot be assumed. The connection is the only carrier that is always there, and the bind happens
+		before this is built, so the port named here is one that is really listening.
+		"""
+		return {
+			"Authorization": f"Bearer {token}",
+			"Accept": "text/event-stream",
+			"X-Familiar-Plugin": PLUGIN_VERSION,
+			"X-Familiar-Ingress": str(self._ingress_port),
+		}
+
 	async def _hold_channel(self, token: str) -> None:
 		"""Hold the connection open, and answer what comes down it."""
 		import aiohttp
@@ -1059,14 +1084,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		async with aiohttp.ClientSession(timeout=timeout) as session:
 			async with session.get(
 				f"{self._url}{CHANNEL_STREAM_PATH}",
-				headers={
-					"Authorization": f"Bearer {token}",
-					"Accept": "text/event-stream",
-					# The build this machine runs, on EVERY connection rather than only when it pairs: the version
-					# column is the one thing that answers "did the update land?", and a machine set up over its
-					# shell never pairs at all - so a version sent only at pairing would never exist for it.
-					"X-Familiar-Plugin": PLUGIN_VERSION,
-				},
+				headers=self._channel_headers(token),
 			) as response:
 				if response.status == 401:
 					# Not a token this Familiar knows: its instance was deleted, or the token was revoked. Pairing

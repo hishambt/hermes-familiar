@@ -269,6 +269,8 @@ async def _port_run():
     adapter._profile_key = lambda: "alpha"
     started_first = await first.connect()
     port_first = first._ingress_port
+    # What the CONNECTION says its ingress is, which is the one carrier that always reaches Familiar.
+    named = first._channel_headers("tok")["X-Familiar-Ingress"]
 
     second = adapter.FamiliarAdapter(config(url=URL))
     second._ingress_port_set = False
@@ -290,10 +292,10 @@ async def _port_run():
     await first.disconnect()
     await second.disconnect()
 
-    return started_first, port_first, started_second, port_second, remembered, started_strict
+    return started_first, port_first, started_second, port_second, remembered, started_strict, named
 
 
-_sf, _pf, _ss, _ps, _remembered, _strict = asyncio.run(_port_run())
+_sf, _pf, _ss, _ps, _remembered, _strict, _named = asyncio.run(_port_run())
 
 # What this profile took last time is preferred, so the port a reader curls does not move between restarts. Read
 # while the key still says "alpha", and with no operator setting in the environment: a construction under the
@@ -335,6 +337,23 @@ check(
     "an operator's own setting is honoured exactly: a taken port fails rather than moving",
     _strict is False,
     str(_strict),
+)
+# The port is REPORTED to Familiar on the connection itself, because that is the only carrier that is always
+# there. Asserting it against the port that was really bound - not the one binding STARTED from - is also what
+# proves the order inside connect(): a header built before the bind would name the number another profile took.
+check(
+    "and the connection names the port it is really listening on, not the one it started from",
+    _named == str(_pf) and _named != str(_port_base),
+    f"named={_named} bound={_pf} started from {_port_base}",
+)
+# And both facts the door reads off a connection: the build, which answers "did the update land?", and the port,
+# which is what a reader's pairing-code command and Familiar's own probe are aimed at.
+_probe_headers = live._channel_headers("tok")
+check(
+    "the connection says both things Familiar reads off it: the build, and where its ingress listens",
+    _probe_headers.get("X-Familiar-Plugin") == adapter.PLUGIN_VERSION
+    and _probe_headers.get("X-Familiar-Ingress") == str(live._ingress_port),
+    str(_probe_headers),
 )
 
 # The two settings a machine remembers live in ONE file, so neither writer may drop the other's half.
