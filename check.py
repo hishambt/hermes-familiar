@@ -2693,10 +2693,12 @@ async def _wait_finds_the_token():
 
     def fake_load(url=""):
         calls["n"] += 1
-        return "tok_abc123" if calls["n"] > 1 else ""
+        # the token is ALREADY there when the wait begins, which is the case that was missed: the second profile
+        # starts waiting a heartbeat after another profile's pairing stored a token, so a change never comes
+        return "tok_abc123" if calls["n"] > 0 else ""
 
     adapter._load_token = fake_load
-    # the real pause is seconds; the behaviour under test is "it looks again at all", not how long it waits
+    # the real pause is seconds; the behaviour under test is "it looks at all", not how long it waits
     adapter.REFUSAL_RETRY_S = 0.05
 
     try:
@@ -2710,7 +2712,7 @@ async def _wait_finds_the_token():
 
 
 check(
-    "a token that arrives for this backend ends the wait, whoever collected it",
+    "a token already present ends the wait, whoever collected it",
     _asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_wait_finds_the_token()),
     "the wait returned once a token appeared",
 )

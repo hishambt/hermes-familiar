@@ -1771,20 +1771,23 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 					return
 
 	async def _wait_for_token(self) -> None:
-		"""Return the moment this backend has a token, whoever collected it.
+		"""Return while this backend has a token, whoever collected it.
 
 		The state file is shared by every profile of a machine, so a code claimed for ONE profile leaves a token every
 		profile can use. A gateway that waits only on its own stream never sees it.
+
+		A token PRESENT is the whole test, not a token that changed: this gateway can begin waiting a heartbeat after
+		another profile's pairing already stored one, and comparing against what it saw at the start would then wait
+		forever for a change that never comes. Measured on the real machine - the second profile paired again three
+		seconds after the token it needed had arrived, because the token was there before its wait began.
+
+		A stale token is not a trap: the connection refuses it, the refusal clears it, and pairing follows.
 		"""
-		had = _load_token(self._url)
-
 		while True:
-			await asyncio.sleep(REFUSAL_RETRY_S)
-
-			now = _load_token(self._url)
-
-			if now and now != had:
+			if _load_token(self._url):
 				return
+
+			await asyncio.sleep(REFUSAL_RETRY_S)
 
 	async def disconnect(self) -> None:
 		if self._channel_task is not None:
