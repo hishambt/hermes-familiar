@@ -2614,7 +2614,7 @@ _url, _token_rescue = live._url, live._token
 _real_refused = adapter._load_refused
 
 live._url = "https://familiar.invalid"
-live._token = "fami-token-that-a-run-ago-was-refused"
+live._token = "a-configured-token-nobody-issued"
 _hint = hashlib.sha256(live._token.encode("utf-8")).hexdigest()[:8]
 
 try:
