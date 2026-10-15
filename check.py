@@ -2610,7 +2610,7 @@ check(
 print("\ntokens that were refused, and runs that are not the one that refused them")
 import hashlib
 
-_url, _url_rescue, _value_rescue = live._url, live._token
+_url_rescue, _value_rescue = live._url, live._token
 _real_refused = adapter._load_refused
 
 live._url = "https://familiar.invalid"
