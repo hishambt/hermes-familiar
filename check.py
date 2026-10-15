@@ -2836,6 +2836,7 @@ print("\nthe state file when two builds share it")
 
 import json as _json, tempfile as _tempfile, pathlib as _pl
 
+_real_state_home = adapter._state_home
 with _tempfile.TemporaryDirectory() as _tmp:
     _root = _pl.Path(_tmp)
     adapter._state_home = lambda: _root / "familiar-platform"
@@ -2857,6 +2858,58 @@ with _tempfile.TemporaryDirectory() as _tmp:
           _entry.get("profiles") == ["default", "prod"],
           f"profiles now {_entry.get('profiles')!r}; entry keys {sorted(_entry)}")
     check("and the token it wrote is the one kept", _entry.get("token") == "u" * 40, str(_entry.get("token"))[:4])
+
+adapter._state_home = _real_state_home
+
+# ----------------------------------------------------------------------------------------------------------------
+# What a machine says when it asks to be paired. This is the app's ONLY chance to learn it: until the request
+# succeeds there is no channel to ask down, and by the time a code is claimed the app has decided what it is creating.
+print("\nwhat a machine says when it asks to be paired")
+
+import asyncio as _aio2
+
+_loop = _aio2.new_event_loop()
+_live_url, _live_token = live._url, live._token
+_real_state_home2 = adapter._state_home
+
+
+def _pair_body(**over):
+    for name, value in over.items():
+        setattr(live, name, value)
+
+    return _loop.run_until_complete(live._pair_body())
+
+
+_body = _pair_body()
+check("the request names which of this machine's profiles is asking",
+      _body.get("profile") == adapter._profile_key(),
+      f"profile={_body.get('profile')!r} vs this gateway's {adapter._profile_key()!r}")
+check("and still carries the machine's name and this build",
+      bool(_body.get("name")) and _body.get("version") == adapter.PLUGIN_VERSION,
+      str(_body)[:90])
+
+with _tempfile.TemporaryDirectory() as _tmp2:
+    adapter._state_home = lambda: _pl.Path(_tmp2) / "familiar-platform"
+
+    check("a machine with nothing to present says it is not paired",
+          _pair_body(_url="https://prod.example", _token="").get("paired") is False,
+          "paired is not False")
+
+    adapter._save_token("https://prod.example", "t" * 40)
+    check("a machine holding a STORED pairing says it is paired",
+          _pair_body(_url="https://prod.example", _token="").get("paired") is True,
+          "paired is not True")
+
+    check("and so does one that was only configured with a token",
+          _pair_body(_url="https://elsewhere.example", _token="c" * 40).get("paired") is True,
+          "a configured token did not count as a credential")
+
+    check("while another Familiar is still a different question",
+          _pair_body(_url="https://other.example", _token="").get("paired") is False,
+          "one backend's token answered for another backend")
+
+adapter._state_home = _real_state_home2
+live._url, live._token = _live_url, _live_token
 
 print("\nwhat creating, renaming and deleting a profile does")
 

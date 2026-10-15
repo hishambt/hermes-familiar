@@ -1863,6 +1863,31 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		if error is not None:
 			logger.warning("[familiar] pairing could not be started: %s", error)
 
+	async def _pair_body(self) -> Dict[str, Any]:
+		"""What this machine says when it asks to be paired.
+
+		Four things, and the last two exist because this request is the ONLY chance to say them: until it succeeds
+		Familiar has no channel, so it cannot ask this machine anything - and by the time a code is claimed the app has
+		already decided what it is creating.
+
+		- ``name`` is Hermes' own name for the machine, and ``version`` is this plugin build, so the app can show both
+		  before anything is claimed.
+		- ``profile`` is WHICH profile is asking. Every profile of a machine runs its own gateway and any one of them
+		  may be the one showing the code, so without it an app is told a machine is asking without being told which
+		  of its agents that is.
+		- ``paired`` is whether this machine already holds a credential for this Familiar. It is the difference between
+		  a new machine and one that is paired again, and the app cannot tell those apart by name: a machine reports
+		  ``hachirokuserver`` where the app named it "Hachi Server", so the names never collide and the app's own
+		  duplicate guard never fires. Measured: re-adding a paired machine made a second row and replaced the token
+		  the first row still held, which is a machine that goes dead with nothing on screen to say why.
+		"""
+		return {
+			"name": await self._machine_name(),
+			"version": PLUGIN_VERSION,
+			"profile": _profile_key(),
+			"paired": bool(_load_token(self._url) or self._token),
+		}
+
 	async def _pair(self) -> None:
 		"""Ask Familiar for a code, show it, and wait for it to be claimed.
 
@@ -1877,7 +1902,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		async with aiohttp.ClientSession(timeout=timeout) as session:
 			started = await session.post(
 				f"{self._url}{CHANNEL_PAIR_PATH}",
-				json={"name": await self._machine_name(), "version": PLUGIN_VERSION},
+				json=await self._pair_body(),
 			)
 			body = await started.json() if started.status == 200 else {}
 			code = str(body.get("code") or "")
