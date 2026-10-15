@@ -1787,6 +1787,17 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 				return
 
+			# The pairing wait finished first, so read HOW it finished. Leaving it unread is how a stream that failed
+			# looked exactly like a stream that was still waiting: the token never arrives, nothing is logged, and the
+			# machine pairs again - which is what a machine that was told to pair again does, so nobody looks closer.
+			# A task whose exception nobody reads is also reported as an unretrieved exception, naming neither the
+			# reason nor the machine.
+			with contextlib.suppress(asyncio.CancelledError):
+				error = waiting.exception()
+
+				if error is not None:
+					logger.warning("[familiar] the pairing wait ended without a token: %s", error)
+
 			return
 
 			async with session.get(f"{self._url}{CHANNEL_PAIR_WAIT_PATH}?secret={secret}") as response:

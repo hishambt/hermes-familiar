@@ -2798,6 +2798,29 @@ check(
     "one token, not two",
 )
 
+
+# 42. A failed pairing wait must say so.
+#
+# The stream that carries a machine's token is the only thing that ends a pairing, and when it failed there was nothing
+# to see: no token, no warning, and a machine that paired again - which is exactly what a machine that was told to pair
+# again does. Measured tonight: the app delivered the token down a stream (captured), and the machine's plugin logged
+# nothing at all, so the failure was invisible from both ends.
+print("\nwhat a pairing wait says when it fails")
+
+_source_pair = (pathlib.Path(__file__).with_name("adapter.py")).read_text(encoding="utf-8")
+_pair_body = _source_pair.split("async def _pair(")[1].split("async def disconnect")[0] if "async def _pair(" in _source_pair else ""
+
+check(
+    "the wait's outcome is read rather than left unread",
+    "waiting.exception()" in _pair_body,
+    "a task's failure is read where it happened",
+)
+check(
+    "and a wait that ended without a token is reported",
+    "the pairing wait ended without a token" in _pair_body,
+    "the log names it",
+)
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")
