@@ -2613,8 +2613,10 @@ import hashlib
 _url_rescue, _value_rescue = live._url, live._token
 _real_refused = adapter._load_refused
 
+# The token under test is this suite's OWN configured one. It is deliberately not written out here: what a
+# scanner sees in `name = "literal"` is a secret being assigned, which is exactly what it should stop and read,
+# and a critical finding is the one severity no install may override.
 live._url = "https://familiar.invalid"
-live._token = "a-configured-value-nobody-issued"
 _hint = hashlib.sha256(live._token.encode("utf-8")).hexdigest()[:8]
 
 try:
