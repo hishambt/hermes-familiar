@@ -1468,6 +1468,11 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		for argv in (
 			["-p", profile, "config", "set", "FAMILIAR_URL", self._url],
 			["-p", profile, "config", "set", "FAMILIAR_TOKEN", self._token],
+			# And the setting the plugin actually READS. The env-shaped names above are read from the machine's
+			# `.env` by a gateway started from a shell, and never by one running as a service: that is every machine
+			# where this worked and none where it did not. So the token goes where the plugin falls back to as well, or
+			# a profile is installed, enabled, wired - and answers nothing.
+			["-p", profile, "config", "set", "platforms.familiar.extra.token", self._token],
 			["-p", profile, "config", "set", "FAMILIAR_INSTANCE", _default_instance_name()],
 		):
 			code, output = await asyncio.to_thread(_run_hermes, argv, 120)

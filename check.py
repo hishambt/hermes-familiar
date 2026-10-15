@@ -2578,6 +2578,11 @@ check(
     str([line for line in _flat if "gateway" in line]),
 )
 check(
+    "and writes it where the plugin READS it, not only into the machine's .env",
+    _ran_command("-p", "test_profile", "config", "set", "platforms.familiar.extra.token"),
+    str([line for line in _flat if "extra.token" in line]),
+)
+check(
     "and RESTARTS its gateway, so the settings it was given are the ones it runs with",
     _ran_command("-p", "test_profile", "gateway", "restart"),
     str([line for line in _flat if "restart" in line]),
