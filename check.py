@@ -575,8 +575,16 @@ check(
     live._presented_token(),
 )
 adapter._mark_refused(live._url, "tok_abc123")
+
+# The RUN is what makes a refusal final, and that distinction is the point. A token refused in THIS run is not offered
+# again - which is what stops a dead token being retried forever. One a PREVIOUS run refused is tried once more,
+# because a single refusal is also what a race looks like: measured on a real machine, Familiar refused its own token
+# once (a delivery that raced the issuing of the token it carried), and the machine then held a perfectly good token
+# and never offered it again - pairing forever while every read aimed at it timed out.
+adapter._REFUSED_THIS_RUN.add(adapter._token_hint("tok_abc123"))
+
 check(
-    "once Familiar refuses it, it is not offered again, so the machine pairs",
+    "once THIS run has had it refused, it is not offered again, so the machine pairs",
     live._presented_token() == "",
     repr(live._presented_token()),
 )
@@ -2592,6 +2600,50 @@ check(
     _answer.get("gateway") is True,
     json.dumps(_answer)[:150],
 )
+
+
+# 37. A refusal from an earlier run does not stop this one from offering the token.
+#
+# Measured: Familiar refused its own token once, the machine remembered it, and from then on it offered NOTHING and
+# asked to be paired - with the right token in its hand and every read timing out. One refusal is what a race looks
+# like, so it is tried once per run, and a refusal made HERE is final for this run so it cannot become a 401 loop.
+print("\ntokens that were refused, and runs that are not the one that refused them")
+import hashlib
+
+_url, _token_rescue = live._url, live._token
+_real_refused = adapter._load_refused
+
+live._url = "https://familiar.invalid"
+live._token = "fami-token-that-a-run-ago-was-refused"
+_hint = hashlib.sha256(live._token.encode("utf-8")).hexdigest()[:8]
+
+try:
+    # An earlier run recorded this exact token as refused, and nothing is stored from a pairing - so the CONFIGURED
+    # token is the one under test rather than one a pairing put there.
+    adapter._load_refused = lambda url="": _hint
+    _real_load_token = adapter._load_token
+    adapter._load_token = lambda url="": ""
+    adapter._REFUSED_THIS_RUN.clear()
+
+    check(
+        "a token a PREVIOUS run had refused is offered again",
+        live._presented_token() == live._token,
+        f"offered {bool(live._presented_token())}",
+    )
+
+    # ... and once THIS run has had it refused, it stops being offered, which is what keeps it from looping.
+    adapter._REFUSED_THIS_RUN.add(_hint)
+
+    check(
+        "and one refused in THIS run is not offered again, so it cannot loop",
+        live._presented_token() == "",
+        f"offered {bool(live._presented_token())}",
+    )
+finally:
+    adapter._load_refused = _real_refused
+    adapter._load_token = _real_load_token
+    adapter._REFUSED_THIS_RUN.clear()
+    live._url, live._token = _url, _token_rescue
 
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:

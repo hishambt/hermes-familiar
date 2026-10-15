@@ -98,6 +98,10 @@ GATEWAY_INSTALL_TIMEOUT_S = 180
 #: leave the entry behind and the machine would never read as unpaired again.
 PAIRING_KEYS = ("token", "refused")
 
+# ``_token_hint``s this process has already offered and had refused, so a token is tried once per run rather than
+# once per connection attempt. A refusal from a PREVIOUS run is deliberately absent from this: see ``_offer_token``.
+_REFUSED_THIS_RUN: set = set()
+
 #: The directory this plugin keeps that state in, under Hermes' home rather than inside the plugin. It coincides
 #: with the install name and is a separate fact on purpose: one is where state lives, the other is what
 #: `plugins install|enable|doctor` call the plugin.
@@ -1199,7 +1203,20 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		if stored:
 			return stored
 
-		if self._token and _token_hint(self._token) == _load_refused(self._url):
+		if not self._token:
+			return ""
+
+		# A refusal recorded by an EARLIER run is not a verdict on this one. Measured on a real machine: Familiar
+		# refused its own token once - a delivery that raced the issuing of the token it carried - and the machine
+		# then held a perfectly good token and never offered it again, pairing forever while every read aimed at it
+		# timed out. One refusal is what a race looks like, and a connection attempt is new information.
+		#
+		# Bounded, so this is not a retry loop: one offering per run per token, and a token refused HERE is added and
+		# left alone until the process restarts. Without that it would sit in a 401 loop, which is the thing the
+		# record exists to prevent.
+		hint = _token_hint(self._token)
+
+		if hint == _load_refused(self._url) and hint in _REFUSED_THIS_RUN:
 			return ""
 
 		return self._token
@@ -1541,6 +1558,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 							"[familiar] Familiar does not accept the token this machine was configured with; pairing again"
 						)
 						_mark_refused(self._url, self._token)
+						_REFUSED_THIS_RUN.add(_token_hint(self._token))
 
 					raise RuntimeError(f"the channel refused this machine's token (HTTP {response.status})")
 
