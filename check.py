@@ -2647,6 +2647,33 @@ finally:
     adapter._REFUSED_THIS_RUN.clear()
     live._url, live._token = _url_rescue, _value_rescue
 
+
+# 38. A pairing forgets what this run had refused.
+print("\nwhat a successful pairing does to a refusal")
+live._url = "https://familiar.invalid"
+_real_load_token_again = adapter._load_token
+adapter._load_token = lambda url="": ""
+
+try:
+    adapter._REFUSED_THIS_RUN.add(adapter._token_hint(live._token))
+    _blocked = live._presented_token()
+
+    adapter._forget_refusals()
+
+    check(
+        "a refusal blocks the configured token until a pairing happens",
+        _blocked == "",
+        f"blocked={_blocked!r}",
+    )
+    check(
+        "and a pairing clears it, so a token Familiar just issued is offered",
+        live._presented_token() == live._token,
+        f"offered {bool(live._presented_token())}",
+    )
+finally:
+    adapter._load_token = _real_load_token_again
+    adapter._REFUSED_THIS_RUN.clear()
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")

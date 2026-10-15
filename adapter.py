@@ -749,6 +749,18 @@ def _load_refused(url: str = "") -> str:
 	return str(_entry_for(url).get("refused") or "")
 
 
+def _forget_refusals() -> None:
+    """Forget what this RUN has had refused, because a pairing answers all of it.
+
+    A pairing hands the machine a token Familiar has just issued, so nothing refused before it applies any
+    more - and the run's own memory is the part that outlives the stored one: a pairing pops the record kept
+    on disk, while the token offered within the same run stayed blocked. Measured: delete a machine, add it
+    again, and the machine pairs successfully and then will not offer the token it just collected until
+    something restarts it.
+    """
+    _REFUSED_THIS_RUN.clear()
+
+
 def _mark_refused(url: str, token: str) -> None:
 	"""Remember that this machine must stop presenting a token it was configured with.
 
@@ -1664,6 +1676,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 						if token:
 							_save_token(self._url, token)
+							_forget_refusals()
 							self._take_token(token)
 							self._pair_code = ""
 							logger.info("[familiar] paired: this machine is reachable through the channel now")
