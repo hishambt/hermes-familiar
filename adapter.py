@@ -992,6 +992,17 @@ def _post(url: str, token: str, payload: Dict[str, Any], path: str = NOTIFY_PATH
 			"Content-Type": "application/json",
 			"Authorization": f"Bearer {token}",
 			"User-Agent": _user_agent(payload),
+			# WHICH profile is speaking, on EVERY call and not only on the channel.
+			#
+			# One machine pairs once and then runs a gateway per activated profile, so one token arrives on several
+			# connections and Familiar has to work out WHICH agent spoke. With a single profile it does not need to
+			# be told; with two it has nothing else to go on, and a call that does not name one is refused outright -
+			# deliberately, since filing it under either agent would be a wrong answer nothing on screen could show
+			# to be wrong.
+			#
+			# The refusal it gets back is the same generic one a bad token gets, which is how a machine that simply
+			# never named itself read as a machine whose token was refused - for hours, while the token was fine.
+			"X-Familiar-Profile": _profile_key(),
 		},
 	)
 	try:

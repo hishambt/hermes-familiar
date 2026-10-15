@@ -56,6 +56,7 @@ class Handler(BaseHTTPRequestHandler):
                 "path": self.path,
                 "auth": self.headers.get("Authorization"),
                 "agent": self.headers.get("User-Agent"),
+                "profile": self.headers.get("X-Familiar-Profile"),
                 "json": json.loads(raw),
             }
         )
@@ -2477,6 +2478,45 @@ check(
 
 # leave the run's temp home as it was found, so nothing after this reads a file from a check
 wrote(json.dumps(_KEEP))
+
+
+# 35. EVERY call says WHICH profile it is.
+#
+# One machine pairs once and runs a gateway per ACTIVATED profile, so one token arrives on several connections and
+# Familiar has to work out which agent spoke. With a single profile it does not need telling. With two it has nothing
+# else to go on, and a call that does not name one is refused - correctly, because filing it under the wrong agent is
+# a wrong answer nothing on screen could show to be wrong.
+#
+# The channel named its profile from the start. Every OTHER call did not, and the refusal that earned is the SAME
+# generic one a bad token gets: a machine that never named itself read as a machine whose token was refused. On a real
+# machine with two profiles that was every delivery and every answer, for hours, while its token was perfectly good.
+print("\nevery call names its profile")
+
+# The rule is about the calls Familiar authenticates with THIS MACHINE'S TOKEN, because those are the ones it has to
+# tell apart when a machine runs several profiles. Two kinds of post are not: a pairing, which carries a code rather
+# than the token and names its profile in the body it sends, and the machine's own loopback ingress, which is a post
+# to itself.
+# ...and not the machine handing a message to its OWN ingress, which is a post to itself: it carries this machine's
+# token because that is how the ingress door answers it, and Familiar never sees it. It lands on this stub only
+# because the harness points the machine's own address here.
+_OWN_INGRESS = "/familiar/ingress"
+_tokened = [
+    entry
+    for entry in RECEIVED
+    if str(entry.get("auth") or "").startswith("Bearer ") and entry.get("path") != _OWN_INGRESS
+]
+_nameless = [entry["path"] for entry in _tokened if not str(entry.get("profile") or "").strip()]
+
+check(
+    "every call Familiar authenticates with this machine's token names the profile it speaks as",
+    _tokened and not _nameless,
+    f"{len(_nameless)} of {len(_tokened)} without a profile, e.g. {_nameless[:4]}",
+)
+check(
+    "and it is this profile's own name, not a label a reader can rename",
+    all(entry.get("profile") == adapter._profile_key() for entry in _tokened),
+    str(sorted({str(entry.get("profile")) for entry in _tokened})[:4]),
+)
 
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
