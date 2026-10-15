@@ -2864,6 +2864,68 @@ adapter._state_home = _real_state_home
 # ----------------------------------------------------------------------------------------------------------------
 # What a machine says when it asks to be paired. This is the app's ONLY chance to learn it: until the request
 # succeeds there is no channel to ask down, and by the time a code is claimed the app has decided what it is creating.
+# ----------------------------------------------------------------------------------------------------------------
+# Which profiles a Familiar is told about. A machine can be paired with two - prod and dev side by side - and each
+# gets its own. What must never happen: a backend that is told about a profile pointed at ANOTHER one, because the
+# answer is what its picker offers to command.
+print("\nwhat one Familiar is told about another's profiles")
+
+import tempfile as _tempfile3, pathlib as _pl3, types as _types
+
+_real_profile_key = adapter._profile_key
+
+
+def _fake_home(root, name, config_url="", env_url=""):
+    home = root / name
+    home.mkdir(parents=True, exist_ok=True)
+
+    if config_url:
+        (home / "config.yaml").write_text(
+            "platforms:\n  familiar:\n    extra:\n      url: " + config_url + "\n", encoding="utf-8")
+
+    if env_url:
+        (home / ".env").write_text("FAMILIAR_URL=" + env_url + "\n", encoding="utf-8")
+
+    return _types.SimpleNamespace(name=name, is_default=(name == "default"), gateway_running=True, path=str(home))
+
+
+with _tempfile3.TemporaryDirectory() as _t3:
+    _root = _pl3.Path(_t3)
+    _infos = [
+        _fake_home(_root, "default", config_url="https://prod.example"),
+        _fake_home(_root, "prod_second", env_url="https://prod.example/"),
+        _fake_home(_root, "dev_one", config_url="https://dev.example"),
+        _fake_home(_root, "dev_second", env_url="https://dev.example"),
+        _fake_home(_root, "unclaimed"),
+    ]
+
+    # Pinned to a name none of these homes has: the profile THIS process runs in is kept whatever its url says, and
+    # on the machine running this check that profile happens to be called `default` - which would make the fake
+    # `default` home look like this connection's own and leak it into both answers.
+    adapter._profile_key = lambda: "this_gateway"
+
+    _prod = [e["name"] for e in adapter._profiles_report(_infos, "https://prod.example")]
+    _dev = [e["name"] for e in adapter._profiles_report(_infos, "https://dev.example")]
+
+    check("a profile pointed at ANOTHER Familiar is not offered to this one",
+          "dev_one" not in _prod and "dev_second" not in _prod, f"prod sees {_prod}")
+    check("and this one's own profiles are", "default" in _prod and "prod_second" in _prod, f"prod sees {_prod}")
+    check("the two Familiars are answered differently, not the same list twice",
+          _prod != _dev and "default" not in _dev, f"prod {_prod} / dev {_dev}")
+    check("a profile pointed at NOTHING is kept, because that is the one to activate",
+          "unclaimed" in _prod and "unclaimed" in _dev, f"prod sees {_prod}")
+    check("a trailing slash is the same Familiar, not a second one",
+          "prod_second" in _prod, f"prod sees {_prod}")
+    check("with no Familiar named, every profile is answered for",
+          len(adapter._profiles_report(_infos)) == 5, str([e["name"] for e in adapter._profiles_report(_infos)]))
+
+    # the profile THIS connection runs in is never filtered away: it is the one that asked.
+    adapter._profile_key = lambda: "dev_one"
+    _prod_with_dev_current = [e["name"] for e in adapter._profiles_report(_infos, "https://prod.example")]
+    check("the profile this very connection runs in is always kept",
+          "dev_one" in _prod_with_dev_current, f"prod sees {_prod_with_dev_current}")
+    adapter._profile_key = _real_profile_key
+
 print("\nwhat a machine says when it asks to be paired")
 
 import asyncio as _aio2

@@ -109,6 +109,9 @@ STATE_DIR = "familiar-platform"
 
 #: What Hermes knows this plugin as: its directory name, and what `plugins.enabled` lists.
 PLUGIN_NAME = "familiar-platform"
+#: What Hermes knows this platform AS. Not the plugin directory's name: the config is keyed by this, so reading a
+#: sibling profile's settings means knowing the difference.
+PLATFORM_NAME = "familiar"
 
 #: A connection that drops is retried: the far end restarting is not a reason to give up. Backing off, because a
 #: machine that reconnects in a tight loop is a machine nobody can use.
@@ -503,12 +506,62 @@ def _familiar_in(home: Path) -> bool:
 	return isinstance(enabled, list) and PLUGIN_NAME in enabled
 
 
-def _profiles_report(infos: List[Any]) -> List[Dict[str, Any]]:
+def _env_value(home: Path, key: str) -> str:
+	"""One key out of a profile's own `.env`, or "".
+
+	Read as a file rather than through the plugin's own settings helper: that helper answers for the profile this
+	process RUNS in, and the whole point here is a sibling.
+	"""
+	try:
+		for line in (home / ".env").read_text(encoding="utf-8").splitlines():
+			name, _, value = line.partition("=")
+
+			if name.strip() == key:
+				return value.strip().strip('"').strip("'")
+	except Exception:  # noqa: BLE001 - a home with no .env is a profile pointed at nothing
+		return ""
+
+	return ""
+
+
+def _url_in(home: Path) -> str:
+	"""Which Familiar one profile's home is pointed at, or "" when it is pointed at none.
+
+	The two places a profile's own settings can live, in the order the plugin reads them for itself: the config's
+	`platforms.familiar.extra.url`, then `FAMILIAR_URL` in that home's `.env`. Read per home rather than through the
+	loader, for the same reason `_familiar_in` is - the loader answers for the home this process runs in.
+
+	A profile pointed at nothing is a profile no Familiar has claimed yet, and that is deliberately different from one
+	pointed elsewhere: the first is anybody's to adopt, the second belongs to somebody.
+	"""
+	value = ""
+
+	try:
+		from utils import fast_safe_load
+
+		config = fast_safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+		platforms = config.get("platforms") if isinstance(config, dict) else None
+		familiar = platforms.get(PLATFORM_NAME) if isinstance(platforms, dict) else None
+		extra = familiar.get("extra") if isinstance(familiar, dict) else None
+		value = str((extra or {}).get("url") or "").strip() if isinstance(extra, dict) else ""
+	except Exception:  # noqa: BLE001 - a config that cannot be read points nowhere, which is the truth
+		value = ""
+
+	return _backend_key(value or _env_value(home, "FAMILIAR_URL"))
+
+def _profiles_report(infos: List[Any], backend: str = "") -> List[Dict[str, Any]]:
 	"""What Familiar is told about this machine's profiles, one entry each.
 
 	A pure assembly of what Hermes already knows, so the only decision here is which facts travel: the name, whether
 	it is the machine's own Hermes home, whether a gateway of its own is running, whether FAMILIAR is on it, and
 	whether it is the profile this very connection belongs to.
+
+	Scoped to *backend*, the Familiar asking, because a machine may be paired with two - prod and dev side by side -
+	and each is answered for the profiles pointed at it. Without this the machine hands a dev Familiar the names of
+	prod's profiles and invites it to command them.
+
+	A profile pointed at NOTHING is kept, and deliberately: that is a profile no Familiar has claimed, which is what
+	the picker offers to activate. Only one already pointed at a DIFFERENT Familiar is left out.
 	"""
 	current = _profile_key()
 	report = []
@@ -517,6 +570,11 @@ def _profiles_report(infos: List[Any]) -> List[Dict[str, Any]]:
 		name = str(getattr(info, "name", "") or "")
 
 		if not name:
+			continue
+
+		home = Path(getattr(info, "path", "") or "")
+
+		if backend and name != current and _url_in(home) not in ("", backend):
 			continue
 
 		report.append(
@@ -1685,7 +1743,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		"""
 		infos = await asyncio.to_thread(_list_profiles)
 
-		return {"profiles": await asyncio.to_thread(_profiles_report, infos)}
+		return {"profiles": await asyncio.to_thread(_profiles_report, infos, self._url)}
 
 	async def _channel_activate(self, frame: Dict[str, Any]) -> Dict[str, Any]:
 		"""Put this channel on ANOTHER profile of this machine, in one step.
