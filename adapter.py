@@ -1480,7 +1480,21 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		service_code, service_output = await asyncio.to_thread(
 			_run_hermes, ["-p", profile, "gateway", "install", "--start-now"], GATEWAY_INSTALL_TIMEOUT_S)
 
-		gateway = service_code == 0
+		# RESTARTED, and not merely started. The settings above are read at STARTUP, so a gateway that is already
+		# running - which is exactly what a profile activated a second time has - keeps whatever it read then, and
+		# goes on presenting a token that may have been rotated since. Measured on a real machine: without this, the
+		# profile sat there reporting 401 and asking to be paired, with a perfectly good token in its own settings,
+		# and the difference was one restart.
+		restart_code, restart_output = await asyncio.to_thread(
+			_run_hermes, ["-p", profile, "gateway", "restart"], GATEWAY_INSTALL_TIMEOUT_S)
+
+		gateway = service_code == 0 and restart_code == 0
+		gateway_detail = None
+
+		if service_code != 0:
+			gateway_detail = _answer_line(service_output) or "the gateway service was not installed"
+		elif restart_code != 0:
+			gateway_detail = _answer_line(restart_output) or "the gateway service did not restart"
 
 		return {
 			"profile": profile,
@@ -1491,7 +1505,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			# The gateway may still be coming up, and that is not a failure of the install: the app asks the machine
 			# which profiles are running rather than believing this.
 			"gateway": gateway,
-			"gatewayDetail": None if gateway else (_answer_line(service_output) or "the gateway service was not installed"),
+			"gatewayDetail": gateway_detail,
 		}
 
 	async def _hold_channel(self, token: str) -> None:

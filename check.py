@@ -2578,6 +2578,11 @@ check(
     str([line for line in _flat if "gateway" in line]),
 )
 check(
+    "and RESTARTS its gateway, so the settings it was given are the ones it runs with",
+    _ran_command("-p", "test_profile", "gateway", "restart"),
+    str([line for line in _flat if "restart" in line]),
+)
+check(
     "and the answer says so",
     _answer.get("gateway") is True,
     json.dumps(_answer)[:150],
