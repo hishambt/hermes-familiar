@@ -2518,6 +2518,71 @@ check(
     str(sorted({str(entry.get("profile")) for entry in _tokened})[:4]),
 )
 
+
+# 36. Activating a profile CONFIGURES it, and runs a gateway FOR it.
+#
+# Installing the plugin into another profile and enabling it is half the work: the profile's gateway needs the same
+# three settings this one runs with, and something has to be running to carry them. A profile with the plugin on it
+# and no gateway is a profile that answers nothing - which is exactly what a reader sees, and what they just asked
+# to leave. The gateway is installed as a SERVICE, because a gateway started from a shell is a foreground process
+# holding the lock, and that took a machine's whole channel down the one time it was tried.
+print("\nputting this channel on another profile")
+
+_ran: list = []
+
+
+def _fake_hermes(args, timeout=None):
+    _ran.append(list(args))
+
+    return 0, "ok"
+
+
+_real_hermes = adapter._run_hermes
+_real_provenance = adapter._install_provenance
+
+# Stubbed because the real ones would clone a repository and install a plugin on the machine running this check.
+adapter._run_hermes = _fake_hermes
+adapter._install_provenance = lambda: ("git@example.invalid:familiar.git", "deadbeef")
+
+try:
+    _answer = asyncio.run(live._channel_activate({"profile": "test_profile"}))
+finally:
+    adapter._run_hermes = _real_hermes
+    adapter._install_provenance = _real_provenance
+
+_flat = [" ".join(call) for call in _ran]
+
+
+def _ran_command(*wanted: str) -> bool:
+    return any(all(word in line for word in wanted) for line in _flat)
+
+
+check(
+    "activating a profile installs the plugin into THAT profile",
+    _ran_command("-p", "test_profile", "plugins", "install", "--enable"),
+    str(_flat[:2]),
+)
+check(
+    "and gives it the URL this machine reaches Familiar at",
+    _ran_command("-p", "test_profile", "config", "set", "FAMILIAR_URL", live._url),
+    str([line for line in _flat if "FAMILIAR_URL" in line]),
+)
+check(
+    "and the token this machine holds, so the profile speaks for the same machine",
+    _ran_command("-p", "test_profile", "config", "set", "FAMILIAR_TOKEN", live._token),
+    str([line[:40] for line in _flat if "FAMILIAR_TOKEN" in line]),
+)
+check(
+    "and installs a GATEWAY SERVICE for it, started now",
+    _ran_command("-p", "test_profile", "gateway", "install", "--start-now"),
+    str([line for line in _flat if "gateway" in line]),
+)
+check(
+    "and the answer says so",
+    _answer.get("gateway") is True,
+    json.dumps(_answer)[:150],
+)
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")

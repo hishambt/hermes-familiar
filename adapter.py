@@ -89,6 +89,9 @@ LOCK_POLL_S = 0.02
 STALE_LOCK_S = 30.0
 #: Attempts at moving a finished document into place. A reader holding the file open refuses the move on Windows.
 MOVE_TRIES = 20
+#: Installing a gateway service clones nothing and starts one process, but it writes a unit and asks systemd to take
+#: it - slower than a setting, and bounded so a machine that hangs does not hang the answer.
+GATEWAY_INSTALL_TIMEOUT_S = 180
 
 #: The only keys a PAIRING entry may hold. A sibling section of the same file - the ports - must never end up
 #: inside one: an entry carrying an unrelated key still looks like a pairing that exists, so clearing it would
@@ -1453,12 +1456,42 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		doctor_code, doctor_output = await asyncio.to_thread(
 			_run_hermes, ["-p", profile, "plugins", "doctor", PLUGIN_NAME], 120)
 
+		# ON THE MACHINE'S OWN CHANNEL, which is the half that install alone does not do. A plugin present and enabled
+		# is not a machine that can deliver: the profile's gateway needs the same three settings this one runs with,
+		# and it has to be a SERVICE - a gateway started from a shell is a foreground process holding the lock, which
+		# took a machine's whole channel down the one time it was tried.
+		#
+		# The values are this install's own, because it is the same machine talking to the same Familiar: only the
+		# label differs, and that is what the profile is. Written through the CLI rather than into a file, for the
+		# reason the app writes them that way too - the gateway seeds the plugin's `extra` from these very settings at
+		# load, so a hand-edited config is replaced by the default and a machine delivers to a port nothing listens on.
+		for argv in (
+			["-p", profile, "config", "set", "FAMILIAR_URL", self._url],
+			["-p", profile, "config", "set", "FAMILIAR_TOKEN", self._token],
+			["-p", profile, "config", "set", "FAMILIAR_INSTANCE", _default_instance_name()],
+		):
+			code, output = await asyncio.to_thread(_run_hermes, argv, 120)
+
+			if code != 0:
+				return {"error": _answer_line(output) or f"the machine would not store a setting ({code})"}
+
+		# And a gateway of its own, as a service. `--start-now` because a profile nobody is running answers nothing,
+		# which is exactly the state the reader just asked to leave.
+		service_code, service_output = await asyncio.to_thread(
+			_run_hermes, ["-p", profile, "gateway", "install", "--start-now"], GATEWAY_INSTALL_TIMEOUT_S)
+
+		gateway = service_code == 0
+
 		return {
 			"profile": profile,
 			"installed": revision,
 			# A registration that did not happen is what a job pointed at that profile discovers LATER, as a
 			# delivery that never arrives - so the machine's own verdict on it travels with the answer.
 			"registered": doctor_code == 0 and "ERROR" not in doctor_output.upper(),
+			# The gateway may still be coming up, and that is not a failure of the install: the app asks the machine
+			# which profiles are running rather than believing this.
+			"gateway": gateway,
+			"gatewayDetail": None if gateway else (_answer_line(service_output) or "the gateway service was not installed"),
 		}
 
 	async def _hold_channel(self, token: str) -> None:
