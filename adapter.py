@@ -81,6 +81,15 @@ PAIR_PROBE_TICK_S = 0.1
 #: What a paired machine's state is called. Where it lives is `_state_path`.
 STATE_FILE = "state.json"
 
+#: How long a writer waits for another profile to finish with the state file. Every write is a few hundred bytes, so
+#: this is not a wait anybody reaches by waiting.
+LOCK_WAIT_S = 10.0
+LOCK_POLL_S = 0.02
+#: A lock file older than this is one whose owner died holding it.
+STALE_LOCK_S = 30.0
+#: Attempts at moving a finished document into place. A reader holding the file open refuses the move on Windows.
+MOVE_TRIES = 20
+
 #: The only keys a PAIRING entry may hold. A sibling section of the same file - the ports - must never end up
 #: inside one: an entry carrying an unrelated key still looks like a pairing that exists, so clearing it would
 #: leave the entry behind and the machine would never read as unpaired again.
@@ -310,13 +319,97 @@ def _load_pairings(url: str) -> Dict[str, Any]:
 
 
 def _write_raw(state: Dict[str, Any]) -> None:
-	"""Write the machine's state file exactly as given."""
+	"""Write the machine's state file exactly as given, and never PART of it.
+
+	Written beside itself and moved into place, because a reader must see one document or the other and nothing in
+	between. Writing the file directly TRUNCATES it first, so there is a window - short, and not short enough - where
+	the document on disk is empty: every profile of a machine shares this one file, and a reader in that window
+	merges its own section into "nothing" and writes that back. One profile recording its port became the loss of the
+	pairing every profile depends on, which is a machine that answers nothing and says nothing about why.
+	"""
 	try:
 		path = _state_path()
 		path.parent.mkdir(parents=True, exist_ok=True)
-		path.write_text(json.dumps(state, indent="\t"), encoding="utf-8")
+		text = json.dumps(state, indent="\t")
+		# Named for the process that owns it, because two profiles write here and a shared scratch name is the same
+		# collision one step earlier.
+		scratch = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+		scratch.write_text(text, encoding="utf-8")
+
+		# A reader with this file open is enough to refuse the move on Windows, and a reader is not a reason to lose
+		# a write: the move is retried, and the scratch file goes either way.
+		for attempt in range(MOVE_TRIES):
+			try:
+				os.replace(scratch, path)
+
+				break
+			except OSError:
+				if attempt == MOVE_TRIES - 1:
+					raise
+
+				time.sleep(LOCK_POLL_S)
 	except Exception as error:  # noqa: BLE001 - state that will not persist is worth a warning, not a crash
 		logger.warning("[familiar] could not save this machine's state: %s", error)
+
+
+def _state_has_content() -> bool:
+	"""Whether there is a document on disk, readable or not."""
+	try:
+		return bool(_state_path().read_text(encoding="utf-8").strip())
+	except Exception:  # noqa: BLE001 - a file that will not be read is not a file with nothing in it
+		return False
+
+
+@contextlib.contextmanager
+def _state_lock(timeout: float = LOCK_WAIT_S):
+	"""One writer at a time, across the PROFILES that share this file.
+
+	They are separate processes - a gateway each - and they all read this file, change their own part of it and write
+	it back. Two of those overlapping is not a theoretical race, it is a lost update: whichever read comes first is
+	the document the second write is based on. An atomic write alone cannot fix that, because nothing was ever half
+	written; the read and the write simply have to be one step, which is what a lock makes them.
+
+	A lock file, and not a lock inside the file, because the thing being protected is the file itself. It carries no
+	content: its EXISTENCE is the lock, so it is safe to leave behind and safe to break.
+	"""
+	path = Path(f"{_state_path()}.lock")
+	deadline = time.monotonic() + timeout
+	held = False
+
+	while True:
+		try:
+			os.close(os.open(str(path), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+			held = True
+
+			break
+		except FileExistsError:
+			# A lock its owner died holding must not outlive it, and its age is the only thing that tells the two
+			# apart: no write takes a fraction of this, so a lock this old is nobody's.
+			try:
+				if time.time() - path.stat().st_mtime > STALE_LOCK_S:
+					path.unlink(missing_ok=True)
+
+					continue
+			except OSError:
+				pass
+
+			if time.monotonic() > deadline:
+				# Said out loud and then done anyway: a machine that stops writing its own state because another
+				# profile is wedged is a machine that has lost more than a port.
+				logger.warning("[familiar] another profile has held this machine's state file for %ss: writing anyway", timeout)
+
+				break
+
+			time.sleep(LOCK_POLL_S)
+
+	try:
+		yield
+	finally:
+		if held:
+			try:
+				path.unlink(missing_ok=True)
+			except OSError as error:  # noqa: BLE001 - a lock that will not go is broken by its own age
+				logger.warning("[familiar] could not release this machine's state lock: %s", error)
 
 
 def _write_state(**sections: Any) -> None:
@@ -326,19 +419,47 @@ def _write_state(**sections: Any) -> None:
 	laid down only the half it was holding would drop the other half. The flat keys of a file written before a
 	machine could hold two pairings are dropped here: the caller has already folded them into ``pairings``, and
 	leaving them beside the map they became would resurrect them on the next read.
+
+	An empty read over a file that is NOT empty means the read failed - the document is corrupt, or was being
+	replaced while it was read. Merging this writer's section into "nothing" would persist that nothing and take the
+	pairing with it, so a write that brings no pairing of its own is refused instead. That is the whole difference
+	between a lost port, which heals itself, and a machine that has to pair again - and it is the case that leaves no
+	trace at all unless it is said out loud here.
 	"""
-	state = _read_raw()
-	state.update(sections)
+	if not _read_raw() and not sections.get("pairings") and _state_has_content():
+		logger.warning(
+			"[familiar] this machine's state file could not be read, and this write carries no pairing to replace it "
+			"with: refusing to overwrite it (%s)",
+			", ".join(sorted(sections)),
+		)
 
-	# ONLY a writer that just folded the flat document into ``pairings`` may remove its keys. A writer that came
-	# to record something else - this profile's port - has not folded anything, and a file still in the flat shape
-	# is a machine that PAIRED that way: dropping ``token`` there would take the pairing away from every machine
-	# that has one, on the first run after it updated.
-	if "pairings" in sections:
-		state.pop("token", None)
-		state.pop("refused", None)
+		return
 
-	_write_raw(state)
+	# The read and the write are one step: the document the merge is based on must be the one the lock was taken for.
+	with _state_lock():
+		state = _read_raw()
+		state.update(sections)
+
+		# ONLY a writer that just folded the flat document into ``pairings`` may remove its keys. A writer that came
+		# to record something else - this profile's port - has not folded anything, and a file still in the flat shape
+		# is a machine that PAIRED that way: dropping ``token`` there would take the pairing away from every machine
+		# that has one, on the first run after it updated.
+		if "pairings" in sections:
+			state.pop("token", None)
+			state.pop("refused", None)
+
+		_write_raw(state)
+
+
+def _fold_pairings(state: Dict[str, Any], pairings: Dict[str, Any]) -> None:
+	"""Put a pairings map into a state document, dropping the flat keys it replaced.
+
+	Beside the map rather than in it, those keys are a SECOND copy of the pairing, and one that outlives the map's
+	own entry: an unpaired machine would read as paired on the next start.
+	"""
+	state["pairings"] = pairings
+	state.pop("token", None)
+	state.pop("refused", None)
 
 
 def _save_pairings(pairings: Dict[str, Any]) -> None:
@@ -489,6 +610,35 @@ def _load_ingress_port(profile: str) -> Optional[int]:
 		return None
 
 
+@contextlib.contextmanager
+def _state_change(writes_pairing: bool = False):
+	"""Read this machine's state, change it, and write it back - as ONE step, under the lock.
+
+	For any writer whose new value is built FROM the file. Reading the section here and writing it back there looks
+	the same as reading it in the caller and passing it in, and is not: the read would happen outside the lock, on a
+	document another profile may already have replaced. That is a lost update, and it is how a profile recording its
+	own port dropped the port the other profile had recorded a moment before.
+
+	The same refusal as ``_write_state``, for the same reason: an empty read over a file that is NOT empty is a read
+	that failed, and writing this change over it would take the pairing with it. A caller that BRINGS a pairing is the
+	recovery, and is allowed through.
+	"""
+	if not writes_pairing and not _read_raw() and _state_has_content():
+		logger.warning(
+			"[familiar] this machine's state file could not be read, and this change carries no pairing to replace it "
+			"with: leaving it exactly as it is"
+		)
+
+		yield None
+
+		return
+
+	with _state_lock():
+		state = _read_raw()
+		yield state
+		_write_raw(state)
+
+
 def _save_ingress_port(profile: str, port: int) -> None:
 	"""Remember which loopback port this profile took.
 
@@ -496,10 +646,14 @@ def _save_ingress_port(profile: str, port: int) -> None:
 	across a reboot - and the one place a person reads a pairing code would move out from under them. Recorded,
 	it is stable: a profile keeps the port it has, and only takes another when that one is genuinely gone.
 	"""
-	ports = _read_raw().get("ingress")
-	ports = dict(ports) if isinstance(ports, dict) else {}
-	ports[profile] = int(port)
-	_write_state(ingress=ports)
+	with _state_change() as state:
+		if state is None:
+			return
+
+		ports = state.get("ingress")
+		ports = dict(ports) if isinstance(ports, dict) else {}
+		ports[profile] = int(port)
+		state["ingress"] = ports
 
 
 def _entry_for(url: str) -> Dict[str, Any]:
@@ -519,27 +673,37 @@ def _save_token(url: str, token: str) -> None:
 	two Familiars holds two entries rather than one token overwriting the other.
 	"""
 	key = _backend_key(url)
-	pairings = _load_pairings(url)
-	entry = dict(pairings.get(key) or {})
-	entry["token"] = token
-	# A pairing that succeeds answers any earlier refusal: whatever Familiar turned down is not what this machine
-	# presents now.
-	entry.pop("refused", None)
-	pairings[key] = entry
-	_save_pairings(pairings)
+
+	with _state_change(writes_pairing=True) as state:
+		if state is None:
+			return
+
+		pairings = _migrate(state, url)
+		entry = dict(pairings.get(key) or {})
+		entry["token"] = token
+		# A pairing that succeeds answers any earlier refusal: whatever Familiar turned down is not what this machine
+		# presents now.
+		entry.pop("refused", None)
+		pairings[key] = entry
+		_fold_pairings(state, pairings)
 
 
 def _clear_token(url: str = "") -> None:
 	"""Forget THIS backend's pairing, and only this one. Every other Familiar the machine talks to stays paired."""
 	key = _backend_key(url)
-	pairings = _load_pairings(url)
-	entry = {k: v for k, v in dict(pairings.get(key) or {}).items() if k in PAIRING_KEYS}
-	entry.pop("token", None)
 
-	if entry:
-		pairings[key] = entry  # a remembered refusal outlives the token it was about
-	else:
-		pairings.pop(key, None)
+	with _state_change(writes_pairing=True) as state:
+		if state is None:
+			return
+
+		pairings = _migrate(state, url)
+		entry = {k: v for k, v in dict(pairings.get(key) or {}).items() if k in PAIRING_KEYS}
+		entry.pop("token", None)
+
+		if entry:
+			pairings[key] = entry  # a remembered refusal outlives the token it was about
+		else:
+			pairings.pop(key, None)
 
 	if pairings:
 		_save_pairings(pairings)

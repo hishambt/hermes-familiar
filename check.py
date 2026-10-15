@@ -2352,6 +2352,132 @@ check(
     str(len(RECEIVED) - before),
 )
 
+
+# 34. A STATE FILE SHARED BY TWO PROFILES IS NOT LOST BY ONE OF THEM WRITING.
+#
+# Every profile of a machine is its own gateway, its own process, and they all keep their state in this one file -
+# the pairings, and the loopback port each profile took. Three things about that are each enough to lose a machine's
+# token outright, and all three happened at once on a real machine:
+#
+#   * the write TRUNCATED the file first, so there was a window where the document read as empty;
+#   * a reader in that window merged its own section into "nothing" and wrote that back, so the pairing was gone;
+#   * and nothing said a word, because there was nothing to notice - the file was valid, just empty of everything
+#     that mattered. From the app the machine then posts with no token at all, forever: it answers nothing, and the
+#     only thing on screen is that the instance did not answer.
+#
+# What is checked here is the file's own invariants, driven through the functions that really write it.
+print("\nthis machine's state file, written by more than one profile at once")
+
+_state = adapter._state_path()
+_state.parent.mkdir(parents=True, exist_ok=True)
+_KEEP = {"pairings": {"http://familiar.example": {"token": "tok_kept"}}}
+
+
+def wrote(text: str) -> None:
+    _state.write_text(text, encoding="utf-8")
+
+
+# 34a. A document that is there and cannot be read is NOT a document with nothing in it.
+#
+# Merging into an empty read is how the port of one profile became the loss of the pairing of all of them. A write
+# carrying no pairing has nothing to replace it with, so it must refuse rather than persist the emptiness - and say
+# so, because this is the one failure that leaves no other trace anywhere.
+torn = '{"pairings": {"http://familiar.example": {"token": "tok_kept"'
+
+wrote(torn)
+refusals = _Collector()
+adapter.logger.addHandler(refusals)
+
+try:
+    adapter._save_ingress_port("default", 8644)
+finally:
+    adapter.logger.removeHandler(refusals)
+
+check(
+    "a write carrying no pairing leaves a state file it could not read exactly as it was",
+    _state.read_text(encoding="utf-8") == torn,
+    _state.read_text(encoding="utf-8")[:80],
+)
+check(
+    "and says why, rather than losing the pairing quietly",
+    any("could not be read" in record.getMessage() for record in refusals.records),
+    str([record.getMessage() for record in refusals.records]),
+)
+
+# 34b. Two profiles recording their ports at the same time keep BOTH ports and the pairing between them.
+#
+# The read and the write of one section have to be one step. Without that, the second writer bases its document on
+# a read taken before the first writer's, and the difference is simply gone.
+wrote(json.dumps(_KEEP))
+
+def _record(profile: str, port: int) -> None:
+    for _ in range(40):
+        adapter._save_ingress_port(profile, port)
+
+
+_racers = [threading.Thread(target=_record, args=(name, port)) for name, port in (("default", 8644), ("test_profile", 8645))]
+for racer in _racers:
+    racer.start()
+for racer in _racers:
+    racer.join()
+
+after = json.loads(_state.read_text(encoding="utf-8"))
+check(
+    "two profiles writing at once keep the machine's pairing",
+    after.get("pairings") == _KEEP["pairings"],
+    json.dumps(after)[:120],
+)
+check(
+    "and neither profile's port is lost",
+    after.get("ingress") == {"default": 8644, "test_profile": 8645},
+    json.dumps(after.get("ingress")),
+)
+
+# 34c. No reader ever sees half a document.
+#
+# A writer truncates before it fills, unless it writes beside itself and moves the finished document into place. A
+# reader watching this file while it is written is the only way to see that, and a large document is what makes the
+# window wide enough to catch.
+_pad = {"pairings": {"http://familiar.example": {"token": "tok_kept"}}, "pad": {str(i): "x" * 40 for i in range(4000)}}
+_stop = threading.Event()
+_half_read = []
+
+
+def _watch() -> None:
+    while not _stop.is_set():
+        # A document that will not PARSE is a torn write, and that is the thing being looked for. A read that fails
+        # outright is a different event, and a safe one: it reads as nothing, which every writer here now refuses to
+        # merge into while the file still has content.
+        try:
+            raw = _state.read_text(encoding="utf-8")
+        except OSError:
+            continue
+
+        try:
+            json.loads(raw)
+        except ValueError:
+            _half_read.append(raw[:40])
+
+
+_watcher = threading.Thread(target=_watch, daemon=True)
+_watcher.start()
+
+try:
+    for _ in range(40):
+        adapter._write_raw(_pad)
+finally:
+    _stop.set()
+    _watcher.join(timeout=2)
+
+check(
+    "no reader ever sees a document that is half written",
+    not _half_read,
+    f"{len(_half_read)} torn reads",
+)
+
+# leave the run's temp home as it was found, so nothing after this reads a file from a check
+wrote(json.dumps(_KEEP))
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")
