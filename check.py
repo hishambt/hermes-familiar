@@ -2828,6 +2828,36 @@ check(
 # which is the friction that keeps profiles unused. What matters for the tests is that the app cannot make it run
 # anything the machine would refuse - the name is validated with Hermes' own function, and the refusals (the machine's
 # own profile, the one this connection runs in, a delete that was not confirmed) never reach a command at all.
+# ----------------------------------------------------------------------------------------------------------------
+# A state file two BUILDS share. Dev and prod can run different plugin versions on one machine, and both write the
+# machine's ONE state file. What must never happen: an older build folds the map and drops a key a newer one wrote -
+# the pairing survives, the key does not, and whatever wrote it goes quietly missing.
+print("\nthe state file when two builds share it")
+
+import json as _json, tempfile as _tempfile, pathlib as _pl
+
+with _tempfile.TemporaryDirectory() as _tmp:
+    _root = _pl.Path(_tmp)
+    adapter._state_home = lambda: _root / "familiar-platform"
+    (_root / "familiar-platform").mkdir(parents=True, exist_ok=True)
+    _state = _root / "familiar-platform" / "state.json"
+
+    # what a NEWER build wrote: a token, plus a key this build has never heard of
+    _state.write_text(
+        _json.dumps({"pairings": {"https://prod.example": {"token": "t" * 40, "profiles": ["default", "prod"]}}}),
+        encoding="utf-8",
+    )
+
+    # the older build saves its own pairing, which is the ordinary case: a token it just collected
+    adapter._save_token("https://prod.example", "u" * 40)
+
+    _entry = (_json.loads(_state.read_text(encoding="utf-8")).get("pairings") or {}).get("https://prod.example") or {}
+
+    check("a key this build does not know survives its own write",
+          _entry.get("profiles") == ["default", "prod"],
+          f"profiles now {_entry.get('profiles')!r}; entry keys {sorted(_entry)}")
+    check("and the token it wrote is the one kept", _entry.get("token") == "u" * 40, str(_entry.get("token"))[:4])
+
 print("\nwhat creating, renaming and deleting a profile does")
 
 import asyncio as _asyncio_profiles
