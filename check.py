@@ -2821,6 +2821,107 @@ check(
     "the log names it",
 )
 
+
+# 43. Profile management runs Hermes' own command, behind Hermes' own rules.
+#
+# The machine is the actor: creating, renaming and deleting a profile used to mean Hermes' command line on the machine,
+# which is the friction that keeps profiles unused. What matters for the tests is that the app cannot make it run
+# anything the machine would refuse - the name is validated with Hermes' own function, and the refusals (the machine's
+# own profile, the one this connection runs in, a delete that was not confirmed) never reach a command at all.
+print("\nwhat creating, renaming and deleting a profile does")
+
+import asyncio as _asyncio_profiles
+
+_ran: list = []
+_real_run_hermes = adapter._run_hermes
+_real_profile_key = adapter._profile_key
+
+
+def _invoke(coro):
+    return _asyncio_profiles.new_event_loop().run_until_complete(coro)
+
+
+def _fake_run(argv, timeout=300):
+    _ran.append(list(argv))
+    return 0, "ok"
+
+
+adapter._run_hermes = _fake_run
+adapter._profile_key = lambda: "invoker"
+
+try:
+    _ran.clear()
+    made = _invoke(live._channel_create({"profile": "Coder"}))
+    check(
+        "a name typed with capitals becomes the directory Hermes would make",
+        made.get("profile") == "coder",
+        f"answered {made}",
+    )
+    check(
+        "and creating runs exactly Hermes' own command",
+        _ran and _ran[-1] == ["profile", "create", "coder"],
+        f"ran {_ran[-1:] }",
+    )
+
+    _ran.clear()
+    _invoke(live._channel_create({"profile": "writer", "description": "docs and prose"}))
+    check(
+        "a description is passed through as the flag it is",
+        _ran and _ran[-1] == ["profile", "create", "writer", "--description", "docs and prose"],
+        f"ran {_ran[-1:]}",
+    )
+
+    _ran.clear()
+    refused = _invoke(live._channel_create({"profile": "Not A Name"}))
+    check(
+        "a name Hermes would refuse is refused here, in words",
+        bool(refused.get("error")) and not _ran,
+        f"answered {refused} and ran {_ran}",
+    )
+
+    _ran.clear()
+    unconfirmed = _invoke(live._channel_delete({"profile": "coder", "confirm": "codr"}))
+    check(
+        "deleting without the name typed never reaches a command",
+        bool(unconfirmed.get("error")) and not _ran,
+        f"answered {unconfirmed} and ran {_ran}",
+    )
+
+    _ran.clear()
+    own = _invoke(live._channel_delete({"profile": "invoker", "confirm": "invoker"}))
+    check(
+        "and neither does deleting the profile this connection runs in",
+        bool(own.get("error")) and not _ran,
+        f"answered {own} and ran {_ran}",
+    )
+
+    _ran.clear()
+    rooted = _invoke(live._channel_delete({"profile": "default", "confirm": "default"}))
+    check(
+        "nor the machine's own profile, which Familiar is paired with",
+        bool(rooted.get("error")) and not _ran,
+        f"answered {rooted} and ran {_ran}",
+    )
+
+    _ran.clear()
+    gone = _invoke(live._channel_delete({"profile": "coder", "confirm": "coder"}))
+    check(
+        "a confirmed delete runs Hermes' own delete, unanswered prompts included",
+        gone.get("deleted") is True and _ran[-1] == ["profile", "delete", "coder", "-y"],
+        f"answered {gone} and ran {_ran[-1:]}",
+    )
+
+    _ran.clear()
+    renamed = _invoke(live._channel_rename({"profile": "coder", "to": "Writer"}))
+    check(
+        "renaming runs Hermes' own rename, with the name normalised",
+        renamed.get("renamed") is True and _ran[-1] == ["profile", "rename", "coder", "writer"],
+        f"answered {renamed} and ran {_ran[-1:]}",
+    )
+finally:
+    adapter._run_hermes = _real_run_hermes
+    adapter._profile_key = _real_profile_key
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")

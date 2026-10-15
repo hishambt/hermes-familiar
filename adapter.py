@@ -532,6 +532,38 @@ def _profiles_report(infos: List[Any]) -> List[Dict[str, Any]]:
 	return report
 
 
+def _named_profile(raw: Any) -> "tuple[str, str]":
+	"""A profile name Hermes itself would accept, or a reason it would not.
+
+	Normalised and then validated with Hermes' OWN rule - the function its dashboard and its CLI use - so a name
+	Familiar accepts is a name the machine can actually make. Normalised first because a person typing into an app may
+	use capitals while the on-disk directory is lowercase, and Hermes documents that split: `normalize_profile_name`
+	for what a user types, `validate_profile_name` for what a directory may be called.
+
+	The reason travels back as the app's answer rather than being raised: "that name is not usable" is a fact about the
+	request, and the reader is owed it in words.
+	"""
+	typed = str(raw or "").strip()
+
+	if not typed:
+		return "", "no profile named"
+
+	try:
+		from hermes_cli.profiles import normalize_profile_name, validate_profile_name
+
+		name = str(normalize_profile_name(typed) or "").strip()
+		validate_profile_name(name)
+	except ImportError:  # pragma: no cover - an older Hermes, whose rule is documented and stable
+		name = typed.lower()
+
+		if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", name):
+			return "", f"{typed!r} is not a profile name: lowercase letters, digits, - and _ only"
+	except Exception as error:  # noqa: BLE001 - the reason IS the answer
+		return "", str(error)
+
+	return name, ""
+
+
 def _list_profiles() -> List[Any]:
 	"""This machine's profiles, as Hermes itself enumerates them.
 
@@ -1550,6 +1582,99 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		headers["X-Familiar-Profile"] = _profile_key()
 
 		return headers
+
+	async def _channel_create(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+		"""Make a profile on this machine, asked from Familiar.
+
+		A profile is a home Hermes runs a gateway in, and the only way to make one used to be Hermes' own command line
+		on the machine - which is exactly the friction that keeps profiles unused. This runs that same command here:
+		`hermes profile create`, with nothing cloned, because a new agent should start as itself rather than as a copy
+		of whichever profile happened to be first. The app offers the one step that puts this channel on it afterwards.
+
+		The name rule is Hermes' own (`_named_profile`), and the answer carries the name actually used, because a
+		person typing `Coder` gets `coder` and should be told that rather than discovering it later.
+		"""
+		name, reason = _named_profile(frame.get("profile"))
+
+		if reason:
+			return {"error": reason}
+
+		description = str(frame.get("description") or "").strip()
+
+		argv = ["profile", "create", name]
+
+		if description:
+			argv += ["--description", description]
+
+		code, output = await asyncio.to_thread(_run_hermes, argv, 180)
+
+		if code != 0:
+			return {"error": _answer_line(output) or f"hermes profile create exited {code}"}
+
+		return {"profile": name, "created": True}
+
+	async def _channel_rename(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+		"""Rename a profile on this machine.
+
+		Refused for the two profiles that are not merely profiles: the machine's own, whose name is the machine's (a
+		reader renames THAT in Familiar), and the one this very connection runs in - renaming moves the home a running
+		gateway is inside, which is a machine that cannot reach Familiar afterwards and nobody able to say why.
+		"""
+		current, reason = _named_profile(frame.get("profile"))
+
+		if reason:
+			return {"error": reason}
+
+		wanted, reason = _named_profile(frame.get("to"))
+
+		if reason:
+			return {"error": reason}
+
+		if current == _profile_key():
+			return {"error": "that is this profile: renaming it would move the home this connection runs in"}
+
+		if current == DEFAULT_TARGET:
+			return {"error": "that is the machine's own profile: rename the machine in Familiar instead"}
+
+		if wanted == current:
+			return {"profile": current, "to": wanted, "renamed": True}
+
+		code, output = await asyncio.to_thread(_run_hermes, ["profile", "rename", current, wanted], 180)
+
+		if code != 0:
+			return {"error": _answer_line(output) or f"hermes profile rename exited {code}"}
+
+		return {"profile": current, "to": wanted, "renamed": True}
+
+	async def _channel_delete(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+		"""Delete a profile on this machine, behind its name typed out.
+
+		The confirmation is checked HERE as well as in the app, and the two are not redundant: the app's dialog is what
+		a person sees, and this is the half no caller can skip. Hermes' own delete is one command and irreversible.
+
+		The machine's own profile is refused - it is the root home, and it is the thing Familiar is paired with - and
+		so is the profile this connection runs in, whose gateway is this conversation.
+		"""
+		name, reason = _named_profile(frame.get("profile"))
+
+		if reason:
+			return {"error": reason}
+
+		if str(frame.get("confirm") or "").strip() != name:
+			return {"error": f"deleting a profile needs its name typed to confirm: {name}"}
+
+		if name == _profile_key():
+			return {"error": "that is this profile: its gateway is the connection this arrives on"}
+
+		if name == DEFAULT_TARGET:
+			return {"error": "that is the machine's own profile: Familiar is paired with it"}
+
+		code, output = await asyncio.to_thread(_run_hermes, ["profile", "delete", name, "-y"], 300)
+
+		if code != 0:
+			return {"error": _answer_line(output) or f"hermes profile delete exited {code}"}
+
+		return {"profile": name, "deleted": True}
 
 	async def _channel_profiles(self, frame: Dict[str, Any]) -> Dict[str, Any]:
 		"""Answer what profiles this machine has, and which of them Familiar is on.

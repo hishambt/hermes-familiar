@@ -659,7 +659,7 @@ class FamiliarAnswerRoutes:
 	async def _answer_request(self, frame: Dict[str, Any], token: str) -> None:
 		"""Do what Familiar asked down the channel, and answer with the id it came with.
 
-		Six things arrive this way. A MESSAGE is handed to this machine's own ingress, and a READ is answered from
+		Nine things arrive this way. A MESSAGE is handed to this machine's own ingress, and a READ is answered from
 		Hermes' own state - twice over, since which profiles this machine HAS is its own state too. A SETTING changed in the app goes through the same handler the ingress uses - one
 		implementation, two doors, and no second idea of what setting a model means. UNPAIRING is not a setting on a
 		conversation but this machine's whole relationship with that Familiar: it forgets the token. And ACTIVATING a
@@ -686,6 +686,14 @@ class FamiliarAnswerRoutes:
 				# caller with no shell there could do for itself. Implemented on the adapter, where the plugin's own
 				# identity facts live.
 				result = await self._channel_activate(frame)
+			elif action == "create":
+				# A profile is a home Hermes runs a gateway in, and making one used to mean Hermes' own command line
+				# on the machine. Asked rather than pushed, like everything else here.
+				result = await self._channel_create(frame)
+			elif action == "rename":
+				result = await self._channel_rename(frame)
+			elif action == "delete":
+				result = await self._channel_delete(frame)
 			elif action == "unpair":
 				# Answered here rather than through the settings table, because it is not a setting on a
 				# conversation: it is this machine's whole relationship with that Familiar.
