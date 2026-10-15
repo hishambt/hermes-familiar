@@ -13,6 +13,7 @@ Nothing here touches the real ~/.hermes: HERMES_HOME is pointed at a temp direct
 import asyncio
 import contextlib
 import json
+import logging
 import os
 import socket
 import sys
@@ -2267,6 +2268,89 @@ check(
 )
 
 _shutil.rmtree(_root, ignore_errors=True)
+
+
+# 33. A REFUSED reply is reported, not turned into a second failure.
+#
+# The answer to a channel request is posted back with the instance's own token, and Familiar can refuse it: a token
+# that was replaced, an instance switched off. Reporting that refusal is the entire job of this path - and the
+# reporting raised `NameError` instead, because `_DeliveryError` was used in an `except` clause that had never
+# imported it.
+#
+# Invisible until now for a reason worth stating: a name in an `except` clause is resolved when an exception is being
+# HANDLED, never when the module loads. So the line was reachable only on the day a reply really was refused, and the
+# day it happened on a real machine it turned one failure into two - raised where the answer should have gone out, so
+# Familiar heard nothing at all. Silence is the one thing the app cannot tell apart from a machine that is switched
+# off: it waits out its bound and then says the instance did not answer.
+print("\na refused reply")
+
+
+@contextlib.contextmanager
+def refusing_reply():
+    """Answer the reply path the way Familiar does when it refuses a token."""
+    saved = dict(REPLY)
+    REPLY.update(
+        {
+            "code": 401,
+            "body": json.dumps(
+                {
+                    "message": "That is not a delivery token this Familiar issued, or the instance is turned off.",
+                    "code": "instanceDeliveryTokenInvalid",
+                }
+            ),
+        }
+    )
+    try:
+        yield
+    finally:
+        REPLY.clear()
+        REPLY.update(saved)
+
+
+class _Collector(logging.Handler):
+    """Everything the answer path logged, so a report is asserted on and not merely assumed."""
+
+    def __init__(self):
+        super().__init__()
+        self.records = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+collector = _Collector()
+answers.logger.addHandler(collector)
+
+try:
+    with refusing_reply():
+        before = len(RECEIVED)
+        raised = None
+        try:
+            asyncio.run(
+                live._answer_request(
+                    {"id": "refused-1", "action": "api", "method": "GET", "path": "/api/sessions"}, "tok_abc123"
+                )
+            )
+        except Exception as error:  # noqa: BLE001 - the point is whether anything escapes at all
+            raised = error
+finally:
+    answers.logger.removeHandler(collector)
+
+check(
+    "a refused reply does not escape the answer path",
+    raised is None,
+    repr(raised),
+)
+check(
+    "the refusal was reported, in words, rather than swallowed",
+    any("could not answer a channel request" in record.getMessage() for record in collector.records),
+    str([record.getMessage() for record in collector.records]),
+)
+check(
+    "the answer was attempted once and only once",
+    len(RECEIVED) == before + 1,
+    str(len(RECEIVED) - before),
+)
 
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:

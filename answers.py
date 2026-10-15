@@ -43,14 +43,6 @@ try:
 except ImportError:  # pragma: no cover - the flat load is the check suite's
 	from adapter import _is_status_notice
 
-# The notice rule lives in the plugin's own adapter, and the count here needs it: a notice is something that HAPPENED
-# to a conversation, and ``adapter._delivery_kind`` already says which delivered rows those are. The plugin loads as a
-# package; the check suite loads these files flat, hence both spellings.
-try:
-	from .adapter import _is_status_notice
-except ImportError:  # pragma: no cover - the flat load is the check suite's
-	from adapter import _is_status_notice
-
 logger = logging.getLogger(__name__)
 
 
@@ -704,6 +696,21 @@ class FamiliarAnswerRoutes:
 		except Exception as error:  # noqa: BLE001 - an answer is owed either way
 			logger.warning("[%s] a channel request failed: %s", self.name, error)
 			result = {"error": str(error)}
+
+		# What the adapter's own delivery POST raises when Familiar refuses the reply. Imported HERE, not at module
+		# level, for the reason this file's own header gives: the two files import each other, and a function-local
+		# import has no order to get wrong.
+		#
+		# Which matters more here than anywhere else in this file. A name in an `except` clause is not resolved when
+		# the module loads - only when an exception is actually being handled. So this import being missing was
+		# invisible until the day a reply really was refused, and then it turned the reporting of one failure into a
+		# second: `NameError: name '_DeliveryError' is not defined`, raised where the answer should have been posted,
+		# so the machine said nothing at all. Silence is the one failure the app cannot tell from a machine that is
+		# switched off, and it is what a refused reply looked like from Familiar's side.
+		try:
+			from .adapter import _DeliveryError
+		except ImportError:  # pragma: no cover - the flat load is the check suite's
+			from adapter import _DeliveryError
 
 		try:
 			await asyncio.to_thread(
