@@ -2747,6 +2747,57 @@ check(
     "pairing stays reachable",
 )
 
+
+# 41. A token the machine was GIVEN has to reach the config, or a restart forgets it.
+#
+# The state is what a live gateway presents. The config is what a restarted one falls back to. Only the state was
+# written, so every restart went back to the config's token - and after a machine is deleted and added again, that is
+# the one Familiar already refused. Measured on a real machine: it paired, reported its port, and revoked itself on the
+# next restart.
+print("\nwhere a collected token is kept")
+
+import tempfile
+
+
+def _token_reaches_the_config():
+    with tempfile.TemporaryDirectory() as tmp:
+        cfg = pathlib.Path(tmp) / "config.yaml"
+        cfg.write_text(
+            "platforms:\n  familiar:\n    extra:\n      token: tok_abc123\n",
+            encoding="utf-8",
+        )
+        real_path = adapter._config_path
+        adapter._config_path = lambda: cfg
+
+        try:
+            adapter._save_token("https://familiar.invalid", "tok_abc123")
+            unchanged = "tok_abc123" in cfg.read_text(encoding="utf-8")
+
+            adapter._save_token("https://familiar.invalid", "tok_other456")
+            after = adapter._config_path().read_text(encoding="utf-8")
+
+            return unchanged, "tok_other456" in after, "tok_abc123" in after
+        finally:
+            adapter._config_path = real_path
+
+
+try:
+    _unchanged, _has_new, _has_old = _token_reaches_the_config()
+except Exception as _error:  # noqa: BLE001
+    _unchanged, _has_new, _has_old = False, False, False
+    print("   could not run it:", _error)
+
+check(
+    "a token collected by pairing is written into this profile's config",
+    _has_new,
+    "a restarted gateway reads its settings from there",
+)
+check(
+    "and it replaces the stale one rather than sitting beside it",
+    _has_new and not _has_old,
+    "one token, not two",
+)
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")

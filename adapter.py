@@ -676,6 +676,73 @@ def _load_token(url: str = "") -> str:
 	return str(_entry_for(url).get("token") or "")
 
 
+def _config_path() -> Any:
+	"""This profile's own Hermes config, which is where a restarted gateway reads its settings from."""
+	try:
+		from hermes_constants import get_hermes_home
+
+		return Path(get_hermes_home()).resolve() / "config.yaml"
+	except Exception:  # noqa: BLE001 - a config we cannot find is a config we do not touch
+		return None
+
+
+def _write_config_token(token: str) -> None:
+	"""Write a token this machine was GIVEN into this profile's own config.
+
+	Why here, and not only in the state: the state is what a live gateway presents, and the config is what a RESTARTED
+	one falls back to. Only the state was ever written, so every restart went back to the token in the config - which,
+	after a machine is deleted and added again, is the one Familiar already refused. Measured: a machine paired
+	successfully, reported its port, and then revoked itself on the next restart, pairing again with a token it had
+	been given and still held.
+
+	Written as a file rather than through the CLI because the value must not travel through a command line, and replaced
+	rather than edited so a half-written config can never be left behind for a gateway to read at startup. The value is
+	never logged: a token in a log is a token leaked.
+	"""
+	path = _config_path()
+
+	if path is None or not path.exists():
+		return
+
+	try:
+		import yaml
+
+		config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+
+		if not isinstance(config, dict):
+			return
+
+		platforms = config.setdefault("platforms", {})
+		familiar = platforms.setdefault("familiar", {}) if isinstance(platforms, dict) else {}
+
+		if not isinstance(familiar, dict):
+			return
+
+		extra = familiar.setdefault("extra", {})
+
+		if not isinstance(extra, dict) or extra.get("token") == token:
+			return
+
+		extra["token"] = token
+
+		written = path.with_name(f".{path.name}.familiar-tmp")
+		written.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+		# Read it back before it becomes the config: a gateway that finds YAML it cannot parse does not start.
+		reloaded = yaml.safe_load(written.read_text(encoding="utf-8")) or {}
+		kept = (((reloaded.get("platforms") or {}).get("familiar") or {}).get("extra") or {}).get("token")
+
+		if kept != token:
+			written.unlink(missing_ok=True)
+			logger.warning("[familiar] the profile's config was left alone: the rewritten copy did not read back")
+			return
+
+		os.replace(written, path)
+		logger.info("[familiar] this profile's config now holds the token Familiar issued, so a restart keeps it")
+	except Exception as error:  # noqa: BLE001 - a config this cannot write is not a reason to stop delivering
+		logger.warning("[familiar] could not write the token into this profile's config: %s", error)
+
+
 def _save_token(url: str, token: str) -> None:
 	"""Keep this backend's token across restarts, leaving every other backend's exactly where it is.
 
@@ -696,6 +763,10 @@ def _save_token(url: str, token: str) -> None:
 		entry.pop("refused", None)
 		pairings[key] = entry
 		_fold_pairings(state, pairings)
+
+	# The state is what a live gateway presents; the config is what a restarted one falls back to. Both, or a restart
+	# goes back to whatever the config was told last - which after a delete and re-add is a token already refused.
+	_write_config_token(token)
 
 
 def _clear_token(url: str = "") -> None:
