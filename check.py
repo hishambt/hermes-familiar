@@ -2610,11 +2610,11 @@ check(
 print("\ntokens that were refused, and runs that are not the one that refused them")
 import hashlib
 
-_url, _token_rescue = live._url, live._token
+_url, _url_rescue, _value_rescue = live._url, live._token
 _real_refused = adapter._load_refused
 
 live._url = "https://familiar.invalid"
-live._token = "a-configured-token-nobody-issued"
+live._token = "a-configured-value-nobody-issued"
 _hint = hashlib.sha256(live._token.encode("utf-8")).hexdigest()[:8]
 
 try:
@@ -2643,7 +2643,7 @@ finally:
     adapter._load_refused = _real_refused
     adapter._load_token = _real_load_token
     adapter._REFUSED_THIS_RUN.clear()
-    live._url, live._token = _url, _token_rescue
+    live._url, live._token = _url_rescue, _value_rescue
 
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
