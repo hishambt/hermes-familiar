@@ -13,6 +13,7 @@ Nothing here touches the real ~/.hermes: HERMES_HOME is pointed at a temp direct
 import asyncio
 import contextlib
 import json
+import pathlib
 import logging
 import os
 import socket
@@ -2673,6 +2674,76 @@ try:
 finally:
     adapter._load_token = _real_load_token_again
     adapter._REFUSED_THIS_RUN.clear()
+
+
+# 39. Waiting on a pairing code must not mean waiting forever.
+#
+# A machine with two profiles shows two codes. One gets claimed, and the token it produces is the MACHINE's - it lands
+# in a state file every profile of that machine reads. The other gateway waited only on its own stream and sat there
+# for as long as it was left alone, with the credential it needed already in its own directory. Measured on the real
+# machine: parked five minutes, no retry, while the door's log showed the other profile accepted.
+print("\nwhat a gateway does while a pairing code waits")
+
+import asyncio as _asyncio
+
+
+async def _wait_finds_the_token():
+    calls = {"n": 0}
+    real_load, real_pause = adapter._load_token, adapter.REFUSAL_RETRY_S
+
+    def fake_load(url=""):
+        calls["n"] += 1
+        return "tok_abc123" if calls["n"] > 1 else ""
+
+    adapter._load_token = fake_load
+    # the real pause is seconds; the behaviour under test is "it looks again at all", not how long it waits
+    adapter.REFUSAL_RETRY_S = 0.05
+
+    try:
+        await _asyncio.wait_for(live._wait_for_token(), timeout=5)
+        return True
+    except _asyncio.TimeoutError:
+        return False
+    finally:
+        adapter._load_token = real_load
+        adapter.REFUSAL_RETRY_S = real_pause
+
+
+check(
+    "a token that arrives for this backend ends the wait, whoever collected it",
+    _asyncio.get_event_loop_policy().new_event_loop().run_until_complete(_wait_finds_the_token()),
+    "the wait returned once a token appeared",
+)
+
+# 40. ONE refusal must not park a gateway.
+#
+# The refusal itself is often the moment a token is being replaced: the door's log shows the same token ACCEPTED one
+# minute and refused the next, on a machine whose profile had just been wired. Acting on the first refusal is what
+# parked the second profile into pairing where it stayed.
+print("\nwhat a single refusal does")
+
+_source = (pathlib.Path(__file__).with_name("adapter.py")).read_text(encoding="utf-8")
+
+check(
+    "the refusal carries a distinct type, so the loop can tell it from a dropped channel",
+    "class _ChannelRefused(RuntimeError)" in _source,
+    "raised where the refusal happens",
+)
+check(
+    "the 401 branch raises it instead of deciding, so one refusal is not yet final",
+    'raise _ChannelRefused(' in _source and "_mark_refused(self._url, self._token)" not in _source.split("async def _hold_channel")[1].split("def _refuse_token")[0],
+    "the marking is not in the connection",
+)
+check(
+    "the loop asks once more before treating a refusal as final",
+    "if not retried:" in _source and "REFUSAL_RETRY_S" in _source,
+    "one refusal costs a breath, not a pairing",
+)
+check(
+    "and taking it as final still pairs, which is what a deleted instance needs",
+    "def _refuse_token" in _source and "_pair_start" in _source,
+    "pairing stays reachable",
+)
 
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:

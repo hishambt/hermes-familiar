@@ -112,6 +112,9 @@ PLUGIN_NAME = "familiar-platform"
 
 #: A connection that drops is retried: the far end restarting is not a reason to give up. Backing off, because a
 #: machine that reconnects in a tight loop is a machine nobody can use.
+# How long to wait before asking again after ONE refusal. Long enough that a token being replaced has finished being
+# replaced, short enough that a real revocation costs a breath rather than a pairing.
+REFUSAL_RETRY_S = 3.0
 RECONNECT_MIN_S = 1.0
 RECONNECT_MAX_S = 30.0
 
@@ -830,6 +833,16 @@ TIMEOUT_SECONDS = 15.0
 
 
 
+class _ChannelRefused(RuntimeError):
+	"""Familiar would not take this machine's token.
+
+	Raised where the refusal HAPPENS and acted on where the policy lives: one refusal is not yet news, because a
+	connection made in the moment a machine's token is being replaced is refused once and accepted on the next ask.
+	Measured: a gateway restarted right after its profile was wired logged exactly one 401, then connected. Treating
+	that one as final is what parked it into pairing - and a parked gateway stays parked.
+	"""
+
+
 class _DeliveryError(Exception):
 	"""A delivery that did not land. ``retryable`` separates "try again" from "this will never work"."""
 
@@ -1368,6 +1381,23 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		except Exception:  # noqa: BLE001 - a machine with no name is still a machine
 			return "Hermes"
 
+	def _refuse_token(self) -> None:
+		"""Take a refused token as final: remember it, and pair again.
+
+		Reached only after the refusal has been repeated, so a single 401 during a token change is a delay rather than
+		a machine that stops offering the credential it holds. Pairing is reachable from BOTH places a token comes from,
+		which is what a reader gets who deletes an instance and reconnects to a machine still holding its token.
+		"""
+		stored = _load_token(self._url)
+
+		if stored:
+			logger.warning("[familiar] this Familiar no longer accepts this machine's token; pairing again")
+			_clear_token(self._url)
+		elif self._token and _token_hint(self._token) != _load_refused(self._url):
+			logger.warning("[familiar] Familiar does not accept the token this machine was configured with; pairing again")
+			_mark_refused(self._url, self._token)
+			_REFUSED_THIS_RUN.add(_token_hint(self._token))
+
 	async def _channel_loop(self) -> None:
 		"""Keep a connection to Familiar open, for as long as this machine is running.
 
@@ -1378,6 +1408,9 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		that code is the person sitting here, which is who it is for.
 		"""
 		delay = RECONNECT_MIN_S
+		# Whether a refusal has already been given a second chance since the last good connection. Reset whenever a
+		# connection is established, so a machine that works keeps getting one retry per real break.
+		retried = False
 
 		while True:
 			try:
@@ -1393,6 +1426,21 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 				self._take_token(token)
 				await self._hold_channel(token)
 				delay = RECONNECT_MIN_S
+				retried = False
+			except _ChannelRefused as error:
+				# ONE refusal is not yet news. A machine's token is replaced in the moment a pairing lands, and a
+				# connection made a heartbeat earlier is refused and then accepted - measured, not supposed. Ask
+				# again before believing it, because believing it parks this gateway in pairing, and a gateway
+				# parked in pairing never looks at the token the machine has.
+				if not retried:
+					retried = True
+					logger.warning("[%s] channel refused: %s - asking again once", self.name, error)
+
+					await asyncio.sleep(REFUSAL_RETRY_S)
+
+					continue
+
+				self._refuse_token()
 			except asyncio.CancelledError:
 				raise
 			except Exception as error:  # noqa: BLE001 - a connection that drops is retried, never fatal
@@ -1556,23 +1604,10 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 				headers=self._channel_headers(token),
 			) as response:
 				if response.status == 401:
-					# Not a token this Familiar knows: its instance was deleted, or the token was revoked. Pairing
-					# again is the answer, and it has to be reachable from BOTH places a token comes from - otherwise
-					# the machine is stuck, which is what a reader hits who deletes an instance and reconnects to a
-					# machine that still holds its token.
-					stored = _load_token(self._url)
-
-					if stored:
-						logger.warning("[familiar] this Familiar no longer accepts this machine's token; pairing again")
-						_clear_token(self._url)
-					elif self._token and _token_hint(self._token) != _load_refused(self._url):
-						logger.warning(
-							"[familiar] Familiar does not accept the token this machine was configured with; pairing again"
-						)
-						_mark_refused(self._url, self._token)
-						_REFUSED_THIS_RUN.add(_token_hint(self._token))
-
-					raise RuntimeError(f"the channel refused this machine's token (HTTP {response.status})")
+					# Not a token this Familiar knows: its instance was deleted, or the token was revoked. What to do
+					# about it is the channel loop's decision, not this function's: one refusal is often the moment a
+					# machine's token is being replaced, and the very next try is accepted.
+					raise _ChannelRefused(f"the channel refused this machine's token (HTTP {response.status})")
 
 				if response.status != 200:
 					raise RuntimeError(f"the channel answered HTTP {response.status}")
@@ -1658,6 +1693,31 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			self._pair_code = code
 			logger.warning("[familiar] PAIR: enter the code %s in Familiar, and this machine connects", code)
 
+			# While this code waits to be claimed, ANOTHER profile of this machine may have its own code claimed -
+			# the token is the machine's, and the file it lands in is shared. Waiting only on this stream is what
+			# parked a gateway forever: a machine with two profiles showed two codes, one was claimed, the other
+			# gateway sat here while the credential it needed was already in its own state directory.
+			waiting = asyncio.create_task(self._wait_for_pairing(session, secret))
+			arrived = asyncio.create_task(self._wait_for_token())
+
+			done, pending = await asyncio.wait({waiting, arrived}, return_when=asyncio.FIRST_COMPLETED)
+
+			for task in pending:
+				task.cancel()
+
+			for task in pending:
+				with contextlib.suppress(asyncio.CancelledError, Exception):
+					await task
+
+			if arrived in done:
+				self._pair_code = ""
+				self._take_token(_load_token(self._url))
+				logger.info("[familiar] paired by another profile of this machine: using the token it collected")
+
+				return
+
+			return
+
 			async with session.get(f"{self._url}{CHANNEL_PAIR_WAIT_PATH}?secret={secret}") as response:
 				event = ""
 
@@ -1682,6 +1742,49 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 							logger.info("[familiar] paired: this machine is reachable through the channel now")
 
 						return
+
+	async def _wait_for_pairing(self, session: Any, secret: str) -> None:
+		"""Wait on this profile's own pairing stream, and take the token when it is claimed."""
+		async with session.get(f"{self._url}{CHANNEL_PAIR_WAIT_PATH}?secret={secret}") as response:
+			event = ""
+
+			async for raw in response.content:
+				line = raw.decode("utf-8", "replace").rstrip("\r\n")
+
+				if line.startswith("event: "):
+					event = line[7:].strip()
+				elif line.startswith("data: ") and event == "paired":
+					try:
+						paired = json.loads(line[6:])
+					except json.JSONDecodeError:
+						continue
+
+					token = str(paired.get("token") or "")
+
+					if token:
+						_save_token(self._url, token)
+						_forget_refusals()
+						self._take_token(token)
+						self._pair_code = ""
+						logger.info("[familiar] paired: this machine is reachable through the channel now")
+
+					return
+
+	async def _wait_for_token(self) -> None:
+		"""Return the moment this backend has a token, whoever collected it.
+
+		The state file is shared by every profile of a machine, so a code claimed for ONE profile leaves a token every
+		profile can use. A gateway that waits only on its own stream never sees it.
+		"""
+		had = _load_token(self._url)
+
+		while True:
+			await asyncio.sleep(REFUSAL_RETRY_S)
+
+			now = _load_token(self._url)
+
+			if now and now != had:
+				return
 
 	async def disconnect(self) -> None:
 		if self._channel_task is not None:
