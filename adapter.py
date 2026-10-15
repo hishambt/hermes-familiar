@@ -346,6 +346,78 @@ def _save_pairings(pairings: Dict[str, Any]) -> None:
 	_write_state(pairings=pairings)
 
 
+def _familiar_in(home: Path) -> bool:
+	"""Whether one profile's home can reach Familiar: the plugin is THERE, and that home's allow-list names it.
+
+	Two separate facts, and both are needed. Present but not enabled is discovered and never loaded; enabled but not
+	present has nothing to load. The allow-list rule is the plugin loader's own - a name in ``plugins.enabled``, and a
+	missing or malformed key means NOTHING is enabled, which is what makes plugins opt-in in the first place.
+
+	Read per home rather than through the loader: the loader answers for the home the process is RUNNING in and caches
+	by file signature, so borrowing it for a sibling profile would answer for the wrong one and poison its cache.
+	"""
+	if not (home / "plugins" / PLUGIN_NAME).is_dir():
+		return False
+
+	try:
+		from utils import fast_safe_load
+
+		config = fast_safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+	except Exception:  # noqa: BLE001 - a config that cannot be read enables nothing, which is the rule's own default
+		return False
+
+	plugins = config.get("plugins") if isinstance(config, dict) else None
+	enabled = plugins.get("enabled") if isinstance(plugins, dict) else None
+
+	return isinstance(enabled, list) and PLUGIN_NAME in enabled
+
+
+def _profiles_report(infos: List[Any]) -> List[Dict[str, Any]]:
+	"""What Familiar is told about this machine's profiles, one entry each.
+
+	A pure assembly of what Hermes already knows, so the only decision here is which facts travel: the name, whether
+	it is the machine's own Hermes home, whether a gateway of its own is running, whether FAMILIAR is on it, and
+	whether it is the profile this very connection belongs to.
+	"""
+	current = _profile_key()
+	report = []
+
+	for info in infos:
+		name = str(getattr(info, "name", "") or "")
+
+		if not name:
+			continue
+
+		report.append(
+			{
+				"name": name,
+				"default": bool(getattr(info, "is_default", False)),
+				"gatewayRunning": bool(getattr(info, "gateway_running", False)),
+				"familiar": _familiar_in(Path(getattr(info, "path", ""))),
+				"current": name == current,
+			}
+		)
+
+	return report
+
+
+def _list_profiles() -> List[Any]:
+	"""This machine's profiles, as Hermes itself enumerates them.
+
+	``list_profiles`` rather than a glob of ``profiles/*``: it is what ``hermes profile list`` shows, it includes the
+	default home, and it leaves out the tombstone a deleted profile can leave behind. A profile Familiar was never
+	told about is worse than a profile it was told about and cannot reach.
+	"""
+	try:
+		from hermes_cli.profiles import list_profiles
+
+		return list(list_profiles())
+	except Exception as error:  # noqa: BLE001 - an answer is owed, and this one is an empty list plus a log line
+		logger.warning("[%s] could not read this machine's profiles: %s", PLUGIN_NAME, error)
+
+		return []
+
+
 def _install_provenance() -> "tuple[str, str]":
 	"""This copy's own source and revision, from the metadata Hermes writes when it installs a plugin.
 
@@ -1146,6 +1218,17 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			headers["X-Familiar-Ingress"] = str(self._ingress_port)
 
 		return headers
+
+	async def _channel_profiles(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+		"""Answer what profiles this machine has, and which of them Familiar is on.
+
+		A READ, answered from Hermes' own state, like the `api` action. Asked rather than pushed: the app wants this
+		while it is showing a machine, and a copy kept here would be a second answer that goes stale the moment somebody
+		adds or deletes a profile - while the machine is the one thing that always knows.
+		"""
+		infos = await asyncio.to_thread(_list_profiles)
+
+		return {"profiles": await asyncio.to_thread(_profiles_report, infos)}
 
 	async def _channel_activate(self, frame: Dict[str, Any]) -> Dict[str, Any]:
 		"""Put this channel on ANOTHER profile of this machine, in one step.

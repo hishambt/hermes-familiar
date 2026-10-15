@@ -2143,6 +2143,108 @@ check(
     str(_nothing),
 )
 
+# 9. What this machine knows about its OWN profiles - asked down the connection, never stored here. A profile with no
+# Familiar has no channel at all, so whether one is on it is the fact the app has no other way to learn.
+print("\nthis machine's profiles")
+import shutil as _shutil
+import tempfile as _tempfile
+import types as _types
+
+_root = Path(_tempfile.mkdtemp(prefix="profiles-check-"))
+
+
+def _profile_home(name: str, *, present: bool, enabled: object, write_config: bool = True) -> Path:
+    """A profile home built to a stated state, so each branch of the rule is really exercised."""
+    home = _root / name
+    (home / "plugins").mkdir(parents=True)
+
+    if present:
+        (home / "plugins" / adapter.PLUGIN_NAME).mkdir()
+
+    if write_config:
+        body = "" if enabled is None else f"plugins:\n  enabled: {enabled}\n"
+        (home / "config.yaml").write_text(body, encoding="utf-8")
+
+    return home
+
+
+_with = _profile_home("with", present=True, enabled=f"[{adapter.PLUGIN_NAME}]")
+_present_only = _profile_home("present-only", present=True, enabled="[other-plugin]")
+_listed_only = _profile_home("listed-only", present=False, enabled=f"[{adapter.PLUGIN_NAME}]")
+_no_key = _profile_home("no-key", present=True, enabled=None)
+_malformed = _profile_home("malformed", present=True, enabled="familiar-platform")
+_no_config = _profile_home("no-config", present=True, enabled=None, write_config=False)
+_empty_list = _profile_home("empty", present=True, enabled="[]")
+
+check(
+    "a profile with the plugin there AND enabled in its own allow-list is one Familiar is ON",
+    adapter._familiar_in(_with) is True,
+    str(adapter._familiar_in(_with)),
+)
+check(
+    "a profile with the plugin there but NOT enabled is one Familiar is not on: discovered is not loaded",
+    adapter._familiar_in(_present_only) is False,
+    str(adapter._familiar_in(_present_only)),
+)
+check(
+    "a profile that lists it but has nothing to load is not on either",
+    adapter._familiar_in(_listed_only) is False,
+    str(adapter._familiar_in(_listed_only)),
+)
+check(
+    "a profile whose config has no plugins key at all is not on, which is what opt-in means",
+    adapter._familiar_in(_no_key) is False,
+    str(adapter._familiar_in(_no_key)),
+)
+check(
+    "a MALFORMED allow-list enables nothing, exactly as the loader's own rule says",
+    adapter._familiar_in(_malformed) is False,
+    str(adapter._familiar_in(_malformed)),
+)
+check(
+    "an explicitly empty allow-list is not on, and neither is a home with no config to read",
+    adapter._familiar_in(_empty_list) is False and adapter._familiar_in(_no_config) is False,
+    f"empty={adapter._familiar_in(_empty_list)} missing={adapter._familiar_in(_no_config)}",
+)
+
+_info = lambda name, path, **kw: _types.SimpleNamespace(  # noqa: E731 - a row of the shape Hermes hands over
+    name=name, path=path, is_default=kw.get("is_default", False), gateway_running=kw.get("gateway_running", False)
+)
+_report = adapter._profiles_report([
+    _info("default", _with, is_default=True, gateway_running=True),
+    _info("coder", _present_only),
+    _info("writer", _listed_only, gateway_running=True),
+    _info("", _with),
+])
+
+check(
+    "the report has one entry per profile, and skips a nameless one rather than inventing a name for it",
+    [entry["name"] for entry in _report] == ["default", "coder", "writer"],
+    str([entry["name"] for entry in _report]),
+)
+check(
+    "each entry says whether FAMILIAR is on that profile, read from that profile's own home",
+    [entry["familiar"] for entry in _report] == [True, False, False],
+    str([entry["familiar"] for entry in _report]),
+)
+check(
+    "and which one is the machine's own Hermes home, and which has a gateway of its own running",
+    _report[0]["default"] is True
+    and _report[0]["gatewayRunning"] is True
+    and _report[1]["gatewayRunning"] is False
+    and _report[2]["gatewayRunning"] is True,
+    str([(e["default"], e["gatewayRunning"]) for e in _report]),
+)
+check(
+    "and which one THIS connection is on, so the app can tell the profile it is talking to from its siblings",
+    _report[0]["current"] == (adapter._profile_key() == "default")
+    and _report[1]["current"] is False
+    and _report[2]["current"] is False,
+    str([entry["current"] for entry in _report]),
+)
+
+_shutil.rmtree(_root, ignore_errors=True)
+
 print(f"\n{len(PASSED)} passed, {len(FAILED)} failed")
 if FAILED:
     print("failed:")
