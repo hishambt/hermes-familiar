@@ -425,6 +425,29 @@ check(
 
 _holder.close()
 
+# WHICH profile is holding the connection. One machine pairs once and then runs a gateway per activated profile, so N
+# connections carry the SAME token - and without this fact a machine with two agents is indistinguishable from two
+# machines, which is the distinction Familiar's own model turns on.
+_renamed = adapter.FamiliarAdapter(config(url=URL, token="tok_label", instance="Hachi Server"))
+
+check(
+    "the connection names WHICH profile it is, not only which machine",
+    live._channel_headers("tok").get("X-Familiar-Profile") == adapter._profile_key(),
+    str(live._channel_headers("tok").get("X-Familiar-Profile")),
+)
+check(
+    "and it is the profile's own identity rather than the label a reader may have RENAMED",
+    # The label is a display name somebody types; this is which profile it is. A renamed label travelling here would
+    # make two agents on one machine indistinguishable the moment somebody renamed one of them.
+    _renamed._channel_headers("tok_label").get("X-Familiar-Profile") == adapter._profile_key(),
+    f"label={adapter._default_instance_name()!r} reported={_renamed._channel_headers('tok_label').get('X-Familiar-Profile')!r}",
+)
+check(
+    "and it is never empty, because the app keys an instance by it",
+    bool(str(live._channel_headers("tok").get("X-Familiar-Profile", "")).strip()),
+    repr(live._channel_headers("tok").get("X-Familiar-Profile")),
+)
+
 # The two settings a machine remembers live in ONE file, so neither writer may drop the other's half.
 adapter._save_token(URL, "tok_two_sections")
 adapter._save_ingress_port("sections", 9999)

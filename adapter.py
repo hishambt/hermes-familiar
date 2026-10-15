@@ -1195,7 +1195,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			delay = min(delay * 2, RECONNECT_MAX_S)
 
 	def _channel_headers(self, token: str) -> Dict[str, str]:
-		"""What this connection says about itself: the build it runs, and the loopback port its ingress took.
+		"""What this connection says about itself: the build it runs, the profile it is, and the port its ingress took.
 
 		Both travel on EVERY connection rather than only when a machine pairs. The version answers "did the update
 		land?" for a machine set up over its shell, which never pairs at all; the port is what Familiar aims a
@@ -1216,6 +1216,12 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		if self._ingress_runner is not None:
 			headers["X-Familiar-Ingress"] = str(self._ingress_port)
+
+		# WHICH profile is holding this connection, and it is the machine's own name for it rather than a label
+		# anybody typed. One machine pairs once and then runs a gateway per activated profile, so N connections carry
+		# the SAME token and the only thing that tells them apart is this - without it a machine with two agents is
+		# indistinguishable from two machines, which is exactly the distinction Familiar has to make.
+		headers["X-Familiar-Profile"] = _profile_key()
 
 		return headers
 
