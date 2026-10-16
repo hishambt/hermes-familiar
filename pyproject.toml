@@ -1,0 +1,19 @@
+[tool.ruff]
+# This plugin is TAB-indented on purpose, and its comments are prose that runs long. Ruff's defaults (4 spaces, 88
+# columns) describe a different codebase, and left alone they report 4514 findings of which 4255 are that disagreement
+# - noise that hides the five that matter. The style is stated here instead so the linter has something true to
+# measure against.
+line-length = 140
+indent-width = 4
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "UP", "B", "SIM"]
+ignore = [
+    "W191",   # tab-indentation: the house style, not a defect
+    "E101",   # mixed spaces and tabs: the same disagreement, seen from the other side
+    "I001",   # import sorting: the imports carry comments and deliberate order, sorted by hand
+    "E402",   # module import not at top of file: some imports must follow a sys.path change or a guarded import
+]
+
+[exclude]
+'.venv' = true

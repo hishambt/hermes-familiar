@@ -26,7 +26,7 @@ import time
 import urllib
 import uuid
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
 # The job draft's model call, in its own file: it is the one thing here that is not the machine's own state. Module
 # level because it imports nothing back - so there is no order to get wrong, unlike the adapter's own import below.
@@ -235,7 +235,8 @@ CONVERSATION_CARRIED = ("tool_call_count",)
 #: be one conversation: a compaction carries the transcript onto a fresh id, and a reset is the reader's own ``/new``,
 #: which starts the next session of the same conversation in a topic - the machine's answers from before it are kept
 #: per topic and cross it, so counting the reset as a new conversation drew one side of a topic and not the other.
-#: A branch and a subagent run are conversations of their own; the store says which in the same field. The instance own word for it, and the ONLY
+#: A branch and a subagent run are conversations of their own; the store says which in the same field. The instance
+#: own word for it, and the ONLY
 #: link that means the same conversation: the same field carries a branch, a reset (a separate conversation by the
 #: instance own account) and a subagent run, and those are conversations of their own.
 CONTINUATION_END_REASONS = ("compression", "session_reset")
@@ -269,7 +270,13 @@ def _row_dict(cursor: Any, row: Any) -> Any:
 	if isinstance(row, dict):
 		return row
 
-	return dict(row) if hasattr(row, "keys") else dict(zip([column[0] for column in cursor.description], row))
+	return (
+			dict(row)
+			if hasattr(row, "keys")
+			# strict: a row and the description of the cursor it came from are the same width, so a
+			# mismatch here is a bug worth raising rather than a row quietly cut short.
+			else dict(zip([column[0] for column in cursor.description], row, strict=True))
+		)
 
 
 def _session_select() -> str:
@@ -299,14 +306,14 @@ def _one(conn: Any, sql: str, params: tuple) -> Any:
 	return _with_recency(_row_dict(cursor, cursor.fetchone()))
 
 
-def _children(conn: Any, session_id: str) -> List[Dict[str, Any]]:
+def _children(conn: Any, session_id: str) -> list[dict[str, Any]]:
 	"""The sessions that point at this one, whole rows: a conversation's numbers live on each of them."""
 	cursor = conn.execute(f"{_session_select()} WHERE s.parent_session_id = ?", (session_id,))
 
 	return [row for row in (_with_recency(_row_dict(cursor, row)) for row in cursor.fetchall()) if row]
 
 
-def _conversation_total(chain: List[Dict[str, Any]], counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+def _conversation_total(chain: list[dict[str, Any]], counts: dict[str, int] | None = None) -> dict[str, Any]:
 	"""What the sessions of one conversation add up to.
 
 	`estimated_cost_usd` stays null when no session in the chain reported one: a total nobody gave is not zero,
@@ -317,7 +324,7 @@ def _conversation_total(chain: List[Dict[str, Any]], counts: Optional[Dict[str, 
 	session's entry, because those entries are a SESSION's numbers and are drawn as such: a row in a list of sessions
 	must answer for that session, not for its whole lineage.
 	"""
-	total: Dict[str, Any] = {field: sum(_number(row.get(field)) for row in chain) for field in CONVERSATION_SUMS}
+	total: dict[str, Any] = {field: sum(_number(row.get(field)) for row in chain) for field in CONVERSATION_SUMS}
 	reported = [row.get("estimated_cost_usd") for row in chain if row.get("estimated_cost_usd") is not None]
 	carrier = chain[-1] if chain else {}
 
@@ -330,7 +337,7 @@ def _conversation_total(chain: List[Dict[str, Any]], counts: Optional[Dict[str, 
 	return total
 
 
-def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, Dict[str, int]]:
+def _visible_counts(conn: Any, session_ids: list[str]) -> dict[str, dict[str, int]]:
 	"""How many MESSAGES and how many NOTICES each of these sessions holds, in ONE query.
 
 	The rule below is the app's own (``saysSomething``): a row a reader can see, and never a ``hidden`` one - the
@@ -360,7 +367,7 @@ def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, Dict[str, in
 		           OR coalesce(reasoning_content, '') <> '')""",
 		tuple(session_ids),
 	)
-	found: Dict[str, Dict[str, int]] = {}
+	found: dict[str, dict[str, int]] = {}
 
 	for row in cursor.fetchall():
 		held = _row_dict(cursor, row) or {}
@@ -377,7 +384,7 @@ def _visible_counts(conn: Any, session_ids: List[str]) -> Dict[str, Dict[str, in
 	return found
 
 
-def _conversation_visible(conn: Any, session_ids: List[str]) -> Dict[str, int]:
+def _conversation_visible(conn: Any, session_ids: list[str]) -> dict[str, int]:
 	"""How many messages a reader can see across a whole conversation, counting each one ONCE.
 
 	The sessions of one conversation overlap. A compaction COPIES the transcript into its child - measured on a real
@@ -421,7 +428,7 @@ def _conversation_visible(conn: Any, session_ids: List[str]) -> Dict[str, int]:
 	return counts
 
 
-def _conversation_chain(conn: Any, session_id: str) -> List[Dict[str, Any]]:
+def _conversation_chain(conn: Any, session_id: str) -> list[dict[str, Any]]:
 	"""The sessions one conversation is, oldest first - the walk itself, and nothing counted.
 
 	A conversation outlives the session it started in: the instance compresses it onto a fresh id and keeps
@@ -482,7 +489,7 @@ def _conversation_chain(conn: Any, session_id: str) -> List[Dict[str, Any]]:
 	return chain
 
 
-def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, Dict[str, int]], counts: Optional[Dict[str, int]]) -> Dict[str, Any]:
+def _conversation_body(chain: list[dict[str, Any]], each: dict[str, dict[str, int]], counts: dict[str, int] | None) -> dict[str, Any]:
 	"""What a conversation reports, given its chain and the count the caller took for it.
 
 	``counts`` is None when the caller asked for the conversation WITHOUT its total: the total is a scan of every
@@ -504,7 +511,7 @@ def _conversation_body(chain: List[Dict[str, Any]], each: Dict[str, Dict[str, in
 	}
 
 
-def _conversations_for(db: Any, ids: List[str], totals: bool = True) -> Dict[str, Any]:
+def _conversations_for(db: Any, ids: list[str], totals: bool = True) -> dict[str, Any]:
 	"""Which conversation each asked session is, and what it adds up to, in the store the caller opened.
 
 	Asked for a page at once rather than row by row, and for the same reason `_visible_counts` is: a page of twenty
@@ -526,7 +533,7 @@ def _conversations_for(db: Any, ids: List[str], totals: bool = True) -> Dict[str
 		raise RuntimeError("the session store came back without a connection to read")
 
 	resolver = getattr(db, "resolve_session_id", None)
-	chains: Dict[str, List[Dict[str, Any]]] = {}
+	chains: dict[str, list[dict[str, Any]]] = {}
 
 	for session_id in ids:
 		resolved = resolver(session_id) if resolver is not None else None
@@ -541,8 +548,8 @@ def _conversations_for(db: Any, ids: List[str], totals: bool = True) -> Dict[str
 	# question, and answering it once cannot change what either of them is told. (Which sessions a chain holds depends
 	# on which session was asked for - see the walk - so keying on anything looser than the chain itself would be a
 	# guess about the walk's rules, and those rules are the machine's, not this page's.)
-	found: Dict[str, Any] = {}
-	counted: Dict[Tuple[str, ...], Dict[str, Any]] = {}
+	found: dict[str, Any] = {}
+	counted: dict[tuple[str, ...], dict[str, Any]] = {}
 
 	for session_id, chain in chains.items():
 		if not chain:
@@ -564,7 +571,7 @@ def _conversations_for(db: Any, ids: List[str], totals: bool = True) -> Dict[str
 	return found
 
 
-def _job_name(job_id: str) -> Optional[str]:
+def _job_name(job_id: str) -> str | None:
 	"""The job's own name, when this process can see the cron store.
 
 	Best effort on purpose: a delivery must not fail because a name could not be read, and the id is already in
@@ -583,12 +590,12 @@ def _job_name(job_id: str) -> Optional[str]:
 # -- The shapes a client parses -------------------------------------------------
 
 
-def _api_error(message: str, code: str) -> Dict[str, Any]:
+def _api_error(message: str, code: str) -> dict[str, Any]:
 	"""Hermes' own error envelope, so a refusal reads the same through either door."""
 	return {"error": {"message": message, "type": "invalid_request_error", "param": None, "code": code}}
 
 
-def _session_payload(session: Dict[str, Any], counts: Optional[Dict[str, int]] = None) -> Dict[str, Any]:
+def _session_payload(session: dict[str, Any], counts: dict[str, int] | None = None) -> dict[str, Any]:
 	"""One session, in the shape the instance's API answers with.
 
 	The fields are the API server's own client-safe list (``api_server.py::_session_response``): a full system
@@ -620,7 +627,7 @@ notice is drawn as a notice rather than counted as something said.
 	return payload
 
 
-def _message_payload(message: Dict[str, Any]) -> Dict[str, Any]:
+def _message_payload(message: dict[str, Any]) -> dict[str, Any]:
 	"""One message, in the shape the instance's API answers with (``api_server.py::_message_response``).
 
 	Compaction scaffolding is stripped the same way: a standalone handoff becomes a hidden empty row with a stable
@@ -656,11 +663,12 @@ def _message_payload(message: Dict[str, Any]) -> Dict[str, Any]:
 
 class FamiliarAnswerRoutes:
 
-	async def _answer_request(self, frame: Dict[str, Any], token: str) -> None:
+	async def _answer_request(self, frame: dict[str, Any], token: str) -> None:
 		"""Do what Familiar asked down the channel, and answer with the id it came with.
 
 		Nine things arrive this way. A MESSAGE is handed to this machine's own ingress, and a READ is answered from
-		Hermes' own state - twice over, since which profiles this machine HAS is its own state too. A SETTING changed in the app goes through the same handler the ingress uses - one
+		Hermes' own state - twice over, since which profiles this machine HAS is its own state too. A SETTING changed in
+		the app goes through the same handler the ingress uses - one
 		implementation, two doors, and no second idea of what setting a model means. UNPAIRING is not a setting on a
 		conversation but this machine's whole relationship with that Familiar: it forgets the token. And ACTIVATING a
 		profile is the machine putting its own channel on another one of its profiles, which nothing off the machine
@@ -727,7 +735,7 @@ class FamiliarAnswerRoutes:
 			logger.warning("[%s] could not answer a channel request: %s", self.name, error)
 
 
-	async def _channel_say(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+	async def _channel_say(self, frame: dict[str, Any]) -> dict[str, Any]:
 		"""Take a message Familiar sent, into this machine's own ingress.
 
 		A message arriving this way IS the same thing the ingress carries, and it is handed to the same door rather
@@ -746,24 +754,23 @@ class FamiliarAnswerRoutes:
 
 		timeout = aiohttp.ClientTimeout(total=30)
 
-		async with aiohttp.ClientSession(timeout=timeout) as session:
-			async with session.post(
-				f"http://127.0.0.1:{self._ingress_port}{self.INGRESS_PATH}",
-				headers={"Authorization": f"Bearer {self._ingress_token}"},
-				json=message,
-			) as response:
-				try:
-					body = await response.json()
-				except Exception:  # noqa: BLE001 - an answer that is not JSON is still an answer
-					body = {}
+		async with aiohttp.ClientSession(timeout=timeout) as session, session.post(
+			f"http://127.0.0.1:{self._ingress_port}{self.INGRESS_PATH}",
+			headers={"Authorization": f"Bearer {self._ingress_token}"},
+			json=message,
+		) as response:
+			try:
+				body = await response.json()
+			except Exception:  # noqa: BLE001 - an answer that is not JSON is still an answer
+				body = {}
 
-				if response.status >= 400:
-					return {"error": f"the ingress answered HTTP {response.status}"}
+			if response.status >= 400:
+				return {"error": f"the ingress answered HTTP {response.status}"}
 
-				return {"sessionId": body.get("sessionId")}
+			return {"sessionId": body.get("sessionId")}
 
 
-	async def _channel_api(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+	async def _channel_api(self, frame: dict[str, Any]) -> dict[str, Any]:
 		"""Answer a path Familiar asked for, from THIS machine's own state.
 
 		A paired machine has no address and no key, so nothing that reads an instance over HTTP applies to it: what
@@ -787,7 +794,7 @@ class FamiliarAnswerRoutes:
 		return {"status": 501, "body": _api_error(f"this machine does not answer {method} {path}", "unsupported_path")}
 
 
-	def _unpair(self) -> Dict[str, Any]:
+	def _unpair(self) -> dict[str, Any]:
 		"""Forget this machine's token, which is what unpairing IS at this end.
 
 		The token is the whole pairing: the connection is authenticated with it, a delivery or an ask carries it, and
@@ -835,7 +842,7 @@ class FamiliarAnswerRoutes:
 
 
 	@staticmethod
-	def _bounded(query: Dict[str, List[str]], key: str, default: int, maximum: int) -> int:
+	def _bounded(query: dict[str, list[str]], key: str, default: int, maximum: int) -> int:
 		"""A page size or an offset, clamped the way the API server clamps it."""
 		try:
 			value = int((query.get(key) or [str(default)])[0])
@@ -846,12 +853,12 @@ class FamiliarAnswerRoutes:
 
 
 	@staticmethod
-	def _no_such_session(session_id: str) -> Dict[str, Any]:
+	def _no_such_session(session_id: str) -> dict[str, Any]:
 		return {"status": 404, "body": _api_error(f"Session not found: {session_id}", "session_not_found")}
 
 
 	async def _api_conversation(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /familiar/conversation - which sessions one conversation is, and what they add up to.
 
 		A conversation outlives the session it started in: the instance compresses it onto a fresh id and keeps
@@ -887,7 +894,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_list_sessions(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /api/sessions - this machine's own sessions, most recently active first.
 
 		``search`` is the store's own free-text filter: it matches a session's title or its id ANYWHERE IN ITS
@@ -909,7 +916,7 @@ class FamiliarAnswerRoutes:
 		search = (query.get("search") or [""])[0].strip() or None
 		include_children = (query.get("include_children") or [""])[0].lower() in ("1", "true", "yes")
 
-		def read(db: Any) -> Dict[str, Any]:
+		def read(db: Any) -> dict[str, Any]:
 			sessions = db.list_sessions_rich(
 				source=source, limit=limit, offset=offset, include_children=include_children,
 				order_by_last_active=True, include_pinned=True, search_query=search)
@@ -950,13 +957,13 @@ class FamiliarAnswerRoutes:
 			"limit": limit, "offset": offset, "has_more": page["has_more"], "total": page["total"]}}
 
 
-	async def _visible_for(self, session_id: str) -> Dict[str, int]:
+	async def _visible_for(self, session_id: str) -> dict[str, int]:
 		"""The visible count for one session, read from the store off the loop."""
 		return await self._with_session_db(
 			lambda db: _visible_counts(getattr(db, "_conn", None), [session_id]))
 
 	async def _api_get_session(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /api/sessions/{id} - one session, which is the cheap question "has anything changed?"."""
 		session = await self._with_session_db(lambda db: db.get_session(groups["session"]))
 
@@ -970,7 +977,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_session_messages(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /api/sessions/{id}/messages - a conversation's transcript, paginated the API's own way."""
 		session_id = groups["session"]
 		order = (query.get("order") or [None])[0]
@@ -1030,7 +1037,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_patch_session(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""PATCH /api/sessions/{id} - what the app changes about a session it did not create: its name.
 
 		The machine's own flags are carried too, because the app relays them; a field this does not know is
@@ -1083,7 +1090,7 @@ class FamiliarAnswerRoutes:
 			"object": "hermes.session", "session": _session_payload(session, visible)}}
 
 
-	def _cron(self) -> Dict[str, Any]:
+	def _cron(self) -> dict[str, Any]:
 		"""This machine's own cron store, imported where the API server imports it.
 
 		The plugin is inside Hermes, so the jobs a client creates are the same records the scheduler runs - reached
@@ -1108,7 +1115,7 @@ class FamiliarAnswerRoutes:
 
 
 	@staticmethod
-	def _no_such_job() -> Dict[str, Any]:
+	def _no_such_job() -> dict[str, Any]:
 		return {"status": 404, "body": _api_error("Job not found", "job_not_found")}
 
 
@@ -1127,7 +1134,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_fork_session(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""POST /api/sessions/{id}/fork - branch a conversation, which is how a topic starts from a session.
 
 		The child is created FIRST and the source ended after it, which is the CLI's own order: a create that fails
@@ -1183,7 +1190,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_delete_session(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""DELETE /api/sessions/{id} - forget a conversation on this machine."""
 		session_id = groups["session"]
 
@@ -1203,7 +1210,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_model_options(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /api/model/options - the model picker's inventory, built where Hermes builds it."""
 		refresh = (query.get("refresh") or [""])[0].lower() in ("1", "true", "yes")
 
@@ -1218,7 +1225,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_list_jobs(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /api/jobs - what this machine has scheduled, a page at a time.
 
 		Paged HERE, for the same reason the sessions list is: the app asks for what its table shows, so a machine with
@@ -1250,7 +1257,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_get_job(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /api/jobs/{id} - one job, as the store holds it."""
 		job = await asyncio.to_thread(self._cron()["get"], groups["job"])
 
@@ -1258,7 +1265,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_create_job(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""POST /api/jobs - schedule something on this machine.
 
 		The job's ORIGIN is this channel, so `deliver: origin` means "wherever Familiar is" rather than an API
@@ -1289,7 +1296,7 @@ class FamiliarAnswerRoutes:
 		if repeat is not None and (not isinstance(repeat, int) or repeat < 1):
 			return {"status": 400, "body": _api_error("Repeat must be a positive integer", "invalid_job")}
 
-		kwargs: Dict[str, Any] = {
+		kwargs: dict[str, Any] = {
 			"prompt": prompt, "schedule": schedule, "name": name,
 			"deliver": fields.get("deliver") or "local",
 			# The PLATFORM, not the label: a delivery resolves a platform by this value, and "Familiar" is
@@ -1361,7 +1368,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_scripts(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""GET /familiar/scripts - what this machine can run, as a job's script.
 
 		A job's script has exactly one legal home - `~/.hermes/scripts/`, the only directory the scheduler runs one
@@ -1373,13 +1380,13 @@ class FamiliarAnswerRoutes:
 
 		return {"status": 200, "body": {"data": scripts, "total": len(scripts)}}
 
-	def _script_files(self) -> List[Dict[str, Any]]:
+	def _script_files(self) -> list[dict[str, Any]]:
 		"""The files in this machine's scripts directory, by name, with how each would run.
 
 		Sorted by name rather than by time: a list of choices is scanned, not read in the order it was written.
 		"""
 		directory = _scripts_directory()
-		rows: List[Dict[str, Any]] = []
+		rows: list[dict[str, Any]] = []
 
 		with contextlib.suppress(OSError):
 			for path in sorted(directory.iterdir(), key=lambda one: one.name.lower()):
@@ -1403,7 +1410,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_draft_job(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""POST /familiar/jobs/draft - a job drafted from the reader's own words.
 
 		The whole reason this call is allowed: the plugin REGISTERED the auxiliary task it asks through, and a task a
@@ -1442,7 +1449,7 @@ class FamiliarAnswerRoutes:
 
 		return {"status": 200, "body": {"draft": answer}}
 
-	def _write_script(self, name: str, text: str) -> Tuple[str, str]:
+	def _write_script(self, name: str, text: str) -> tuple[str, str]:
 		"""Put a script into this machine's scripts directory; ``(name, problem)``.
 
 		The name is held to the same directory and the same suffixes the create door holds a script to, because it is the
@@ -1499,7 +1506,7 @@ class FamiliarAnswerRoutes:
 
 		return clean, ""
 
-	def _script_names(self) -> List[str]:
+	def _script_names(self) -> list[str]:
 		"""The scripts this machine could actually run, by name - what a draft has to choose from.
 
 		Only the runnable ones: offering a file the create door would refuse would invite a draft nobody can save.
@@ -1507,7 +1514,7 @@ class FamiliarAnswerRoutes:
 		return [str(row.get("name")) for row in self._script_files() if row.get("runnable")]
 
 	async def _api_update_job(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""PATCH /api/jobs/{id} - what a reader changed about a job."""
 		fields = body if isinstance(body, dict) else {}
 		# Whitelisted the way the API server whitelists it: a field nobody may set is not silently stored.
@@ -1554,7 +1561,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_delete_job(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""DELETE /api/jobs/{id} - take a job off the schedule."""
 		def work() -> Any:
 			removed = self._cron()["remove"](groups["job"])
@@ -1568,7 +1575,7 @@ class FamiliarAnswerRoutes:
 
 
 	async def _api_job_action(
-			self, groups: Dict[str, str], query: Dict[str, List[str]], body: Any) -> Dict[str, Any]:
+			self, groups: dict[str, str], query: dict[str, list[str]], body: Any) -> dict[str, Any]:
 		"""POST /api/jobs/{id}/run|pause|resume - one job, acted on now."""
 		action = groups["action"]
 		job_id = groups["job"]
@@ -1577,7 +1584,7 @@ class FamiliarAnswerRoutes:
 			return {"status": 400, "body": _api_error("Invalid job ID format", "invalid_job_id")}
 
 		fields = body if isinstance(body, dict) else {}
-		extra: Optional[str] = None
+		extra: str | None = None
 
 		if action == "run" and fields.get("prompt") is not None:
 			extra = str(fields["prompt"])

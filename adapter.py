@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import socket
 import time
-import uuid
 import asyncio
 import contextlib
 import hashlib
@@ -48,7 +47,7 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent, MessageType
@@ -195,10 +194,9 @@ def _state_path() -> Path:
 
 			return legacy
 
-	try:
+	# A home that will not take a directory fails loudly on the write instead.
+	with contextlib.suppress(Exception):
 		path.parent.mkdir(parents=True, exist_ok=True)
-	except Exception:  # noqa: BLE001 - a home that will not take a directory fails loudly on the write instead
-		pass
 
 	return path
 
@@ -234,7 +232,7 @@ def _backend_key(url: str) -> str:
 	return str(url or "").strip().rstrip("/")
 
 
-def _read_raw() -> Dict[str, Any]:
+def _read_raw() -> dict[str, Any]:
 	"""The state file exactly as written; missing or unreadable reads as empty."""
 	try:
 		raw = json.loads(_state_path().read_text(encoding="utf-8")) or {}
@@ -244,7 +242,7 @@ def _read_raw() -> Dict[str, Any]:
 	return raw if isinstance(raw, dict) else {}
 
 
-def _profile_pairing() -> Dict[str, Any]:
+def _profile_pairing() -> dict[str, Any]:
 	"""A pairing kept under the PROFILE's own home, from when a machine paired per profile.
 
 	That reading is gone - a profile is a dimension of a paired machine - so this file is folded into the machine's
@@ -297,7 +295,7 @@ def _retire_profile_state() -> None:
 		logger.warning("[familiar] could not retire this profile's own pairing file: %s", error)
 
 
-def _migrate(raw: Dict[str, Any], url: str) -> Dict[str, Any]:
+def _migrate(raw: dict[str, Any], url: str) -> dict[str, Any]:
 	"""Every pairing the machine holds, keyed by backend, with an older file folded in under *url*.
 
 	"Older" is either shape, and both say the same thing - this machine has paired, once, with the Familiar at *url*:
@@ -326,12 +324,12 @@ def _migrate(raw: Dict[str, Any], url: str) -> Dict[str, Any]:
 	return out
 
 
-def _load_pairings(url: str) -> Dict[str, Any]:
+def _load_pairings(url: str) -> dict[str, Any]:
 	"""Every pairing this machine holds, keyed by the backend that issued it."""
 	return _migrate(_read_raw(), url)
 
 
-def _write_raw(state: Dict[str, Any]) -> None:
+def _write_raw(state: dict[str, Any]) -> None:
 	"""Write the machine's state file exactly as given, and never PART of it.
 
 	Written beside itself and moved into place, because a reader must see one document or the other and nothing in
@@ -464,7 +462,7 @@ def _write_state(**sections: Any) -> None:
 		_write_raw(state)
 
 
-def _fold_pairings(state: Dict[str, Any], pairings: Dict[str, Any]) -> None:
+def _fold_pairings(state: dict[str, Any], pairings: dict[str, Any]) -> None:
 	"""Put a pairings map into a state document, dropping the flat keys it replaced.
 
 	Beside the map rather than in it, those keys are a SECOND copy of the pairing, and one that outlives the map's
@@ -475,7 +473,7 @@ def _fold_pairings(state: Dict[str, Any], pairings: Dict[str, Any]) -> None:
 	state.pop("refused", None)
 
 
-def _save_pairings(pairings: Dict[str, Any]) -> None:
+def _save_pairings(pairings: dict[str, Any]) -> None:
 	"""Write the machine's pairings, each under the backend it belongs to."""
 	_write_state(pairings=pairings)
 
@@ -549,7 +547,7 @@ def _url_in(home: Path) -> str:
 
 	return _backend_key(value or _env_value(home, "FAMILIAR_URL"))
 
-def _home_of(name: str) -> Optional[Path]:
+def _home_of(name: str) -> Path | None:
 	"""One profile's home by name, or None when this machine has no such profile."""
 	for info in _list_profiles():
 		if str(getattr(info, "name", "") or "") == name:
@@ -558,7 +556,7 @@ def _home_of(name: str) -> Optional[Path]:
 	return None
 
 
-def _profiles_report(infos: List[Any], backend: str = "") -> List[Dict[str, Any]]:
+def _profiles_report(infos: list[Any], backend: str = "") -> list[dict[str, Any]]:
 	"""What Familiar is told about this machine's profiles, one entry each.
 
 	A pure assembly of what Hermes already knows, so the only decision here is which facts travel: the name, whether
@@ -599,7 +597,7 @@ def _profiles_report(infos: List[Any], backend: str = "") -> List[Dict[str, Any]
 	return report
 
 
-def _named_profile(raw: Any) -> "tuple[str, str]":
+def _named_profile(raw: Any) -> tuple[str, str]:
 	"""A profile name Hermes itself would accept, or a reason it would not.
 
 	Normalised and then validated with Hermes' OWN rule - the function its dashboard and its CLI use - so a name
@@ -631,7 +629,7 @@ def _named_profile(raw: Any) -> "tuple[str, str]":
 	return name, ""
 
 
-def _list_profiles() -> List[Any]:
+def _list_profiles() -> list[Any]:
 	"""This machine's profiles, as Hermes itself enumerates them.
 
 	``list_profiles`` rather than a glob of ``profiles/*``: it is what ``hermes profile list`` shows, it includes the
@@ -648,7 +646,7 @@ def _list_profiles() -> List[Any]:
 		return []
 
 
-def _install_provenance() -> "tuple[str, str]":
+def _install_provenance() -> tuple[str, str]:
 	"""This copy's own source and revision, from the metadata Hermes writes when it installs a plugin.
 
 	Read from THIS plugin directory's neighbour rather than from the machine root: the root's `plugins/` belongs to
@@ -667,7 +665,7 @@ def _install_provenance() -> "tuple[str, str]":
 	return str(entry.get("source") or ""), str(entry.get("revision") or "")
 
 
-def _run_hermes(argv: List[str], timeout: int = 300) -> "tuple[int, str]":
+def _run_hermes(argv: list[str], timeout: int = 300) -> tuple[int, str]:
 	"""Run Hermes' own command line and read what it said, both streams together.
 
 	`sys.executable -m hermes_cli.main` rather than a `hermes` on PATH: this call comes from inside a running gateway,
@@ -706,7 +704,7 @@ def _answer_line(output: str) -> str:
 	return lines[-1] if lines else ""
 
 
-def _load_ingress_port(profile: str) -> Optional[int]:
+def _load_ingress_port(profile: str) -> int | None:
 	"""The loopback port this profile took last time, or None if it never took one."""
 	ports = _read_raw().get("ingress")
 
@@ -790,7 +788,7 @@ def _forget_ingress(profile: str) -> None:
 			state.pop("ingress", None)
 
 
-def _entry_for(url: str) -> Dict[str, Any]:
+def _entry_for(url: str) -> dict[str, Any]:
 	"""This backend's pairing, or an empty one."""
 	return dict(_load_pairings(url).get(_backend_key(url)) or {})
 
@@ -1046,7 +1044,7 @@ class _DeliveryError(Exception):
 		self.retryable = retryable
 
 
-def _setting(extra: Dict[str, Any], key: str, env: str, default: str = "") -> str:
+def _setting(extra: dict[str, Any], key: str, env: str, default: str = "") -> str:
 	"""``config.yaml extra[key]`` wins over the env var ``env``, as every platform plugin's settings do."""
 	value = extra.get(key)
 	if value is not None and str(value).strip():
@@ -1069,7 +1067,7 @@ def _default_instance_name() -> str:
 	return DEFAULT_TARGET if name.lower() == "hermes" else name
 
 
-def _instance_name(extra: Dict[str, Any]) -> str:
+def _instance_name(extra: dict[str, Any]) -> str:
 	return _setting(extra, "instance", "FAMILIAR_INSTANCE") or _default_instance_name()
 
 
@@ -1086,7 +1084,7 @@ REPLY_KIND = "reply"
 TURN_FINAL_FLAG = "_turn_final"
 
 
-def _turn_final_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _turn_final_metadata(metadata: dict[str, Any] | None) -> dict[str, Any]:
 	"""Mark the turn's OWN final answer, so the far end does not keep a second copy of it.
 
 	A session holds a turn's answer already. Familiar keeps what a session does NOT hold - the gateway's own notices, a
@@ -1109,7 +1107,10 @@ def _turn_final_metadata(metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
 #: the conversation.
 _STATUS_NOTICE_PATTERNS = (
 	re.compile(r"^\s*(?:\u267b\ufe0f|\u26a0\ufe0f)\s*Gateway\s+\S"),
-	re.compile(r"^\s*(?:\u26a1\s*Interrupting|\u21aa\s*Redirected|\u23f3\s*(?:Queued|Subagent working|Compressing context)|\u23e9\s*Steered)"),
+	re.compile(
+		r"^\s*(?:\u26a1\s*Interrupting|\u21aa\s*Redirected|\u23f3\s*(?:Queued|Subagent working|Compressing context)"
+		r"|\u23e9\s*Steered)"
+	),
 	re.compile(r"^\s*\u23f3\s*Working\s+\u2014\s*\d+\s*min"),
 	re.compile(r"^\s*\u26a0\ufe0f\s*No activity"),
 	re.compile(r"^\s*(?:\U0001f5dc\ufe0f?|\u23f3)?\s*Compressed(?: with fallback)?:\s*\d+"),
@@ -1134,7 +1135,7 @@ def _is_status_notice(content: str) -> bool:
 	return any(pattern.match(content or "") for pattern in _STATUS_NOTICE_PATTERNS)
 
 
-def _delivery_kind(content: str, metadata: Optional[Dict[str, Any]]) -> str:
+def _delivery_kind(content: str, metadata: dict[str, Any] | None) -> str:
 	"""Whether this delivery is said in the conversation, or only happened to it.
 
 	The fact travels WITH the delivery so the far end never has to read the words to tell the two apart: a copy that
@@ -1165,7 +1166,7 @@ def _delivery_kind(content: str, metadata: Optional[Dict[str, Any]]) -> str:
 	return NOTICE_KIND if _is_status_notice(content) else MESSAGE_KIND
 
 
-def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def _payload(instance: str, target: str, content: str, metadata: dict[str, Any] | None) -> dict[str, Any]:
 	"""What Familiar receives: the notification, not the job.
 
 	``jobId`` is filled on a cron delivery because the scheduler puts it in the route metadata
@@ -1193,7 +1194,7 @@ def _payload(instance: str, target: str, content: str, metadata: Optional[Dict[s
 	}
 
 
-def _user_agent(payload: Dict[str, Any]) -> str:
+def _user_agent(payload: dict[str, Any]) -> str:
 	"""Who is calling, for the far end's logs.
 
 	A delivery names its instance; a channel reply has no instance in it, because the request id it is
@@ -1205,7 +1206,7 @@ def _user_agent(payload: Dict[str, Any]) -> str:
 	return f"hermes-familiar (instance:{instance})" if instance else "hermes-familiar"
 
 
-def _post(url: str, token: str, payload: Dict[str, Any], path: str = NOTIFY_PATH) -> Dict[str, Any]:
+def _post(url: str, token: str, payload: dict[str, Any], path: str = NOTIFY_PATH) -> dict[str, Any]:
 	"""One POST to Familiar, run in a worker thread. Returns its parsed response body.
 
 	``urllib`` rather than a client library: a delivery channel that stops working because an optional
@@ -1237,10 +1238,9 @@ def _post(url: str, token: str, payload: Dict[str, Any], path: str = NOTIFY_PATH
 			raw = response.read().decode("utf-8", errors="replace")
 	except urllib.error.HTTPError as error:
 		detail = ""
-		try:
+		# A body that will not read is not worth failing the check over: the status is the fact that matters.
+		with contextlib.suppress(Exception):
 			detail = error.read().decode("utf-8", errors="replace")[:200]
-		except Exception:
-			pass
 		# A refused token will not fix itself; a server fault might.
 		raise _DeliveryError(f"HTTP {error.code} {detail}".strip(), retryable=error.code >= 500) from error
 	except (urllib.error.URLError, TimeoutError, OSError) as error:
@@ -1259,14 +1259,14 @@ def _ask_payload(
 	target: str,
 	kind: str,
 	body: str,
-	choices: Optional[List[str]],
+	choices: list[str] | None,
 	request_id: str,
 	session_key: str,
 	callback_prefix: str,
-	command: Optional[str] = None,
-	description: Optional[str] = None,
-	expires_in: Optional[int] = None,
-) -> Dict[str, Any]:
+	command: str | None = None,
+	description: str | None = None,
+	expires_in: int | None = None,
+) -> dict[str, Any]:
 	"""What Familiar receives when the agent needs an answer.
 
 	``requestId`` is the thing that makes the answer land: the gateway resolves the reply through
@@ -1381,27 +1381,27 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		if not self._ingress_port_set:
 			self._ingress_port = _load_ingress_port(_profile_key()) or DEFAULT_INGRESS_PORT
 
-		self._ingress_runner: Optional[Any] = None
+		self._ingress_runner: Any | None = None
 		# chat id -> the session key that conversation is routed by. The routing entry is the only thing that
 		# knows which SESSION an address is on, and it is the gateway's, so it has to be asked per reply rather
 		# than remembered: /new, /reset and a compression rotation all move the key to another session.
-		self._session_keys: Dict[str, str] = {}
+		self._session_keys: dict[str, str] = {}
 		# confirm_id -> (session_key, chat_id): what answering a confirmation this adapter raised resolves, and
 		# where to say so. The pending hold itself lives in the gateway (``tools.slash_confirm``), so this is
 		# only the address of the answer.
-		self._confirms: Dict[str, Any] = {}
+		self._confirms: dict[str, Any] = {}
 		#: What a clarify asked, by its id, so a tap can be read back as the choice it picked.
-		self._clarifies: Dict[str, Any] = {}
+		self._clarifies: dict[str, Any] = {}
 		#: Which conversation an approval was asked in, by its id: resolving one needs the session it belongs to.
-		self._approvals: Dict[str, str] = {}
+		self._approvals: dict[str, str] = {}
 		# chat key -> the directory this conversation works in. Kept in the process as well as applied, so every
 		# later turn of the conversation gets it even though only the ACT of choosing comes through the ingress.
-		self._directories: Dict[str, str] = {}
+		self._directories: dict[str, str] = {}
 		# The connection this machine holds to Familiar, and the code it is showing while it waits to be paired.
-		self._channel_task: Optional[Any] = None
+		self._channel_task: Any | None = None
 		self._pair_code: str = ""
 		# The pairing attempt in flight, if any. One, not one per caller: every attempt mints its own code.
-		self._pairing_task: "asyncio.Task[None] | None" = None
+		self._pairing_task: asyncio.Task[None] | None = None
 		# The lifted HomeChannel is the canonical store; extra and the env are the fallbacks.
 		self._home: str = (
 			str(getattr(config.home_channel, "chat_id", "") or "")
@@ -1483,11 +1483,8 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		#
 		# Started even when the ingress did NOT come up: the channel is what pairs a machine, and a bind that failed
 		# must not also take away the only way to get it fixed.
-		started = False
-
 		if self._url and self._channel_task is None:
 			self._channel_task = asyncio.create_task(self._channel_loop())
-			started = True
 		elif not self._url:
 			logger.warning("[familiar] no FAMILIAR_URL configured, so there is nothing to connect to")
 
@@ -1509,7 +1506,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		return True
 
-	def _ingress_candidates(self) -> List[int]:
+	def _ingress_candidates(self) -> list[int]:
 		"""Every loopback port this adapter will try, in order.
 
 		ONE entry when an operator set the port: their number means their number, and a taken one is a fact they
@@ -1538,7 +1535,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		runner = web.AppRunner(app, access_log=None)
 		await runner.setup()
 
-		refused: Optional[Exception] = None
+		refused: Exception | None = None
 
 		for candidate in self._ingress_candidates():
 			site = web.TCPSite(runner, self._ingress_host, candidate)
@@ -1644,7 +1641,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			await asyncio.sleep(delay)
 			delay = min(delay * 2, RECONNECT_MAX_S)
 
-	def _channel_headers(self, token: str) -> Dict[str, str]:
+	def _channel_headers(self, token: str) -> dict[str, str]:
 		"""What this connection says about itself: the build it runs, the profile it is, and the port its ingress took.
 
 		Both travel on EVERY connection rather than only when a machine pairs. The version answers "did the update
@@ -1675,7 +1672,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		return headers
 
-	async def _channel_create(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+	async def _channel_create(self, frame: dict[str, Any]) -> dict[str, Any]:
 		"""Make a profile on this machine, asked from Familiar.
 
 		A profile is a home Hermes runs a gateway in, and the only way to make one used to be Hermes' own command line
@@ -1705,7 +1702,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		return {"profile": name, "created": True}
 
-	async def _channel_rename(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+	async def _channel_rename(self, frame: dict[str, Any]) -> dict[str, Any]:
 		"""Rename a profile on this machine.
 
 		Refused for the two profiles that are not merely profiles: the machine's own, whose name is the machine's (a
@@ -1738,7 +1735,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		return {"profile": current, "to": wanted, "renamed": True}
 
-	async def _channel_delete(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+	async def _channel_delete(self, frame: dict[str, Any]) -> dict[str, Any]:
 		"""Delete a profile on this machine, behind its name typed out.
 
 		The confirmation is checked HERE as well as in the app, and the two are not redundant: the app's dialog is what
@@ -1771,7 +1768,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		return {"profile": name, "deleted": True}
 
-	async def _channel_profiles(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+	async def _channel_profiles(self, frame: dict[str, Any]) -> dict[str, Any]:
 		"""Answer what profiles this machine has, and which of them Familiar is on.
 
 		A READ, answered from Hermes' own state, like the `api` action. Asked rather than pushed: the app wants this
@@ -1782,7 +1779,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		return {"profiles": await asyncio.to_thread(_profiles_report, infos, self._url)}
 
-	async def _channel_activate(self, frame: Dict[str, Any]) -> Dict[str, Any]:
+	async def _channel_activate(self, frame: dict[str, Any]) -> dict[str, Any]:
 		"""Put this channel on ANOTHER profile of this machine, in one step.
 
 		A machine runs one gateway per profile and the plugin is found in the home it runs in, so a profile without one
@@ -1906,39 +1903,38 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		# reconnect every time the deadline passed.
 		timeout = aiohttp.ClientTimeout(total=None, sock_read=None)
 
-		async with aiohttp.ClientSession(timeout=timeout) as session:
-			async with session.get(
-				f"{self._url}{CHANNEL_STREAM_PATH}",
-				headers=self._channel_headers(token),
-			) as response:
-				if response.status == 401:
-					# Not a token this Familiar knows: its instance was deleted, or the token was revoked. What to do
-					# about it is the channel loop's decision, not this function's: one refusal is often the moment a
-					# machine's token is being replaced, and the very next try is accepted.
-					raise _ChannelRefused(f"the channel refused this machine's token (HTTP {response.status})")
+		async with aiohttp.ClientSession(timeout=timeout) as session, session.get(
+			f"{self._url}{CHANNEL_STREAM_PATH}",
+			headers=self._channel_headers(token),
+		) as response:
+			if response.status == 401:
+				# Not a token this Familiar knows: its instance was deleted, or the token was revoked. What to do
+				# about it is the channel loop's decision, not this function's: one refusal is often the moment a
+				# machine's token is being replaced, and the very next try is accepted.
+				raise _ChannelRefused(f"the channel refused this machine's token (HTTP {response.status})")
 
-				if response.status != 200:
-					raise RuntimeError(f"the channel answered HTTP {response.status}")
+			if response.status != 200:
+				raise RuntimeError(f"the channel answered HTTP {response.status}")
 
-				logger.info("[familiar] channel open to %s", self._url)
+			logger.info("[familiar] channel open to %s", self._url)
 
-				event = ""
+			event = ""
 
-				async for raw in response.content:
-					line = raw.decode("utf-8", "replace").rstrip("\r\n")
+			async for raw in response.content:
+				line = raw.decode("utf-8", "replace").rstrip("\r\n")
 
-					if line.startswith("event: "):
-						event = line[7:].strip()
-					elif line.startswith("data: ") and event == "request":
-						try:
-							frame = json.loads(line[6:])
-						except json.JSONDecodeError:
-							logger.warning("[familiar] a request arrived that could not be read")
-							continue
+				if line.startswith("event: "):
+					event = line[7:].strip()
+				elif line.startswith("data: ") and event == "request":
+					try:
+						frame = json.loads(line[6:])
+					except json.JSONDecodeError:
+						logger.warning("[familiar] a request arrived that could not be read")
+						continue
 
-						asyncio.create_task(self._answer_request(frame, token))
-					elif not line:
-						event = ""
+					asyncio.create_task(self._answer_request(frame, token))
+				elif not line:
+					event = ""
 
 	def _pair_start(self) -> None:
 		"""Start a pairing attempt, unless one is already in flight.
@@ -1975,7 +1971,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		if error is not None:
 			logger.warning("[familiar] pairing could not be started: %s", error)
 
-	async def _pair_body(self) -> Dict[str, Any]:
+	async def _pair_body(self) -> dict[str, Any]:
 		"""What this machine says when it asks to be paired.
 
 		Four things, and the last two exist because this request is the ONLY chance to say them: until it succeeds
@@ -2155,9 +2151,9 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		event: MessageEvent,
 		session_key: str,
 		text_content: str,
-		metadata: Optional[Dict[str, Any]],
+		metadata: dict[str, Any] | None,
 		*,
-		reply_to: Optional[str],
+		reply_to: str | None,
 		is_ephemeral_response: bool = False,
 	):
 		"""The turn's final answer, marked as one: see ``_turn_final_metadata``.
@@ -2178,8 +2174,8 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		self,
 		chat_id: str,
 		content: str,
-		reply_to: Optional[str] = None,
-		metadata: Optional[Dict[str, Any]] = None,
+		reply_to: str | None = None,
+		metadata: dict[str, Any] | None = None,
 	) -> SendResult:
 		"""Send a reply into a Familiar conversation. ``chat_id`` is the conversation; the default is the
 		instance's own inbox."""
@@ -2352,7 +2348,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		task = asyncio.create_task(self.handle_message(event))
 
-		def _report(task: "asyncio.Task") -> None:
+		def _report(task: asyncio.Task) -> None:
 			self._background_tasks.discard(task)
 			if not task.cancelled() and task.exception() is not None:
 				logger.error("[familiar] the turn from the ingress failed: %s", task.exception())
@@ -2412,7 +2408,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		self,
 		chat_id: str,
 		question: str,
-		choices: Optional[List[str]] = None,
+		choices: list[str] | None = None,
 		clarify_id: str = "",
 		session_key: str = "",
 		**kwargs: Any,
@@ -2465,7 +2461,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 			return SendResult(success=False, error="FAMILIAR_TOKEN is not configured")
 
 		command = title
-		expires_in: Optional[int] = None
+		expires_in: int | None = None
 		try:
 			from tools import slash_confirm as _slash_confirm
 
@@ -2498,7 +2494,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		return SendResult(success=True, message_id=str(confirm_id) or None)
 
-	async def _apply_action(self, payload: Dict[str, Any], chat_id: str) -> bool:
+	async def _apply_action(self, payload: dict[str, Any], chat_id: str) -> bool:
 		"""Apply a setting Familiar changed, without it becoming something said in the conversation.
 
 		Two so far: which model a conversation runs on, and where it works. Both are kept under the CHAT key rather
@@ -2549,7 +2545,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 			return ""
 
-	def _apply_model(self, key: str, payload: Dict[str, Any]) -> None:
+	def _apply_model(self, key: str, payload: dict[str, Any]) -> None:
 		"""Point the conversation at a model. Empty clears it, which is the instance's own default."""
 		store = getattr(self, "_session_store", None)
 		model = str(payload.get("model") or "").strip()
@@ -2561,7 +2557,7 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		store.set_model_override(key, {"model": model} if model else None)
 		logger.info("[%s] model for %s is now %s", self.name, key, model or "(the instance's default)")
 
-	def _apply_directory(self, key: str, payload: Dict[str, Any]) -> None:
+	def _apply_directory(self, key: str, payload: dict[str, Any]) -> None:
 		"""Where the conversation works: applied to this key's turns, and written on the session row.
 
 		Both halves are needed, and Hermes itself keeps it this way. The task override is what a running turn's
@@ -2745,14 +2741,14 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		return SendResult(success=True, message_id=str(kwargs.get("request_id") or "") or None)
 
 
-	async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
+	async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
 		return {"name": chat_id or self._home, "type": "dm"}
 
 
 # -- Plugin registration -----------------------------------------------------
 
 
-def _env_enablement() -> Optional[dict]:
+def _env_enablement() -> dict | None:
 	"""Seed ``PlatformConfig.extra`` from env vars during gateway config load.
 
 	``None`` when there is nowhere to talk to: a platform nobody configured must not be enabled, or the gateway
@@ -2768,7 +2764,7 @@ def _env_enablement() -> Optional[dict]:
 	if not url and not token:
 		return None
 
-	seed: Dict[str, Any] = {"url": url or DEFAULT_URL}
+	seed: dict[str, Any] = {"url": url or DEFAULT_URL}
 
 	if token:
 		seed["token"] = token
@@ -2785,10 +2781,10 @@ async def _standalone_send(
 	chat_id: str,
 	message: str,
 	*,
-	thread_id: Optional[str] = None,
-	media_files: Optional[list] = None,
+	thread_id: str | None = None,
+	media_files: list | None = None,
 	force_document: bool = False,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
 	"""Out-of-process delivery, for a cron tick with no gateway holding this adapter.
 
 	The same POST as the adapter's, minus the job id: this signature carries no metadata, so the standalone

@@ -735,7 +735,7 @@ class _FakeCron:
 
 
 def _jobs(query: str) -> dict:
-	parsed: Dict[str, List[str]] = {}
+	parsed: dict[str, list[str]] = {}
 
 	for pair in query.split("&"):
 		if pair:
@@ -822,7 +822,7 @@ manifest_version = next(
 check(
     "a delivery says which build this instance is running",
     RECEIVED[-1]["json"]["pluginVersion"] == manifest_version,
-    "%s vs %s" % (RECEIVED[-1]["json"].get("pluginVersion"), manifest_version),
+    f'{RECEIVED[-1]["json"].get("pluginVersion")} vs {manifest_version}',
 )
 
 # 4. The conversation's session: the one fact only this process can produce.
@@ -1595,7 +1595,11 @@ check("and an approval decision is not treated as something the reader said",
       asyncio.run(live._resolve_approval("appr:nope:once", "default")) == "", "a stale approval resolved something")
 check("and the choices the reader picks from", clarify["json"]["choices"] == ["postgres", "sqlite"], str(clarify["json"].get("choices")))
 check("under the prefix every adapter shares", clarify["json"]["callbackPrefix"] == "cl", str(clarify["json"].get("callbackPrefix")))
-check("an ask says it too, so a quiet instance is still identifiable", clarify["json"]["pluginVersion"] == manifest_version, str(clarify["json"].get("pluginVersion")))
+check(
+    "an ask says it too, so a quiet instance is still identifiable",
+    clarify["json"]["pluginVersion"] == manifest_version,
+    str(clarify["json"].get("pluginVersion")),
+)
 
 asyncio.run(
     live.send_exec_approval(
@@ -1627,7 +1631,11 @@ asyncio.run(
 )
 confirm = RECEIVED[-1]
 check("a confirmation is its own kind, not a message", confirm["json"]["kind"] == "confirm", str(confirm["json"].get("kind")))
-check("under its own prefix, so the answer is not read as something said", confirm["json"]["callbackPrefix"] == "cf", str(confirm["json"].get("callbackPrefix")))
+check(
+    "under its own prefix, so the answer is not read as something said",
+    confirm["json"]["callbackPrefix"] == "cf",
+    str(confirm["json"].get("callbackPrefix")),
+)
 check("with the two answers this app offers", confirm["json"]["choices"] == ["once", "cancel"], str(confirm["json"].get("choices")))
 check("and no 'always': that is a persisted setting, not a choice in a chat", "always" not in confirm["json"]["choices"])
 check(
@@ -1640,7 +1648,11 @@ check(
 before_answer = len(RECEIVED)
 asyncio.run(live._resolve_confirm("cf:cf_1:once", "default"))
 check("answering it resolves the hold rather than becoming a turn", slash_confirm_mod.get_pending(SESSION_KEY) is None)
-check("and says what the gateway did", RECEIVED[-1]["json"]["content"] == "the hold ran with once", str(RECEIVED[-1]["json"].get("content")))
+check(
+    "and says what the gateway did",
+    RECEIVED[-1]["json"]["content"] == "the hold ran with once",
+    str(RECEIVED[-1]["json"].get("content")),
+)
 check("as a reply, on the message path", RECEIVED[-1]["path"] == "/api/hermes/message" and len(RECEIVED) == before_answer + 1)
 
 asyncio.run(live._resolve_confirm("cf:nobody-knows-this:once", "default"))
@@ -1678,7 +1690,11 @@ check("and is retryable", unreachable.retryable is True, str(unreachable.retryab
 
 with without_env("FAMILIAR_TOKEN"):
     tokenless = send(adapter.FamiliarAdapter(config(url=URL)))
-check("no token refuses before a request is made", tokenless.success is False and "FAMILIAR_TOKEN" in (tokenless.error or ""), str(tokenless.error))
+check(
+    "no token refuses before a request is made",
+    tokenless.success is False and "FAMILIAR_TOKEN" in (tokenless.error or ""),
+    str(tokenless.error),
+)
 
 # 5. The standalone sender, for a cron tick with no co-resident gateway.
 print("\nstandalone sender (no gateway)")
@@ -2733,7 +2749,8 @@ check(
 )
 check(
     "the 401 branch raises it instead of deciding, so one refusal is not yet final",
-    'raise _ChannelRefused(' in _source and "_mark_refused(self._url, self._token)" not in _source.split("async def _hold_channel")[1].split("def _refuse_token")[0],
+    'raise _ChannelRefused(' in _source
+    and "_mark_refused(self._url, self._token)" not in _source.split("async def _hold_channel")[1].split("def _refuse_token")[0],
     "the marking is not in the connection",
 )
 check(
@@ -2834,7 +2851,9 @@ check(
 # the pairing survives, the key does not, and whatever wrote it goes quietly missing.
 print("\nthe state file when two builds share it")
 
-import json as _json, tempfile as _tempfile, pathlib as _pl
+import json as _json
+import tempfile as _tempfile
+import pathlib as _pl
 
 _real_state_home = adapter._state_home
 with _tempfile.TemporaryDirectory() as _tmp:
@@ -2870,7 +2889,8 @@ adapter._state_home = _real_state_home
 # answer is what its picker offers to command.
 print("\nwhat one Familiar is told about another's profiles")
 
-import tempfile as _tempfile3, pathlib as _pl3, types as _types
+import tempfile as _tempfile3
+import pathlib as _pl3
 
 _real_profile_key = adapter._profile_key
 
@@ -2930,7 +2950,9 @@ with _tempfile3.TemporaryDirectory() as _t3:
 # Taking a profile that belongs to somebody else, and the port a deleted profile leaves behind.
 print("\nactivating onto a profile another Familiar already has")
 
-import tempfile as _tempfile4, pathlib as _pl4, types as _types2
+import tempfile as _tempfile4
+import pathlib as _pl4
+import types as _types2
 
 _real_list_profiles = adapter._list_profiles
 _real_run_hermes = adapter._run_hermes

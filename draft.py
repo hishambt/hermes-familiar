@@ -15,7 +15,8 @@ this just stops the refusal from being the reader's first sight of it.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Mapping, Optional, Sequence
+from typing import Any
+from collections.abc import Mapping, Sequence
 
 #: The auxiliary task this plugin registers and then calls. Hermes allows a task its own plugin registered, and gives
 #: it an ``auxiliary.<key>`` block with a picker entry and an ``AUXILIARY_<KEY>_*`` env bridge - so which model drafts
@@ -52,7 +53,7 @@ def available() -> bool:
 
 
 #: The four shapes the machine accepts, and the fields each one uses. Nothing else is a job.
-DRAFT_SCHEMA: Dict[str, Any] = {
+DRAFT_SCHEMA: dict[str, Any] = {
     "type": "object",
     "additionalProperties": False,
     "required": [
@@ -197,8 +198,8 @@ def _rule(label: str, values: Sequence[str], empty: str) -> str:
 
 
 def _context_blocks(
-    *, machine: str, scripts: Sequence[str], topics: Sequence[str], current: Optional[Mapping[str, Any]]
-) -> List[str]:
+    *, machine: str, scripts: Sequence[str], topics: Sequence[str], current: Mapping[str, Any] | None
+) -> list[str]:
     """What the model cannot see for itself, as plain lines.
 
     A model with no tools cannot list a directory or read a database, so the machine's own facts are handed to it: the
@@ -225,8 +226,8 @@ async def draft_job(
     machine: str = "",
     scripts: Sequence[str] = (),
     topics: Sequence[str] = (),
-    current: Optional[Mapping[str, Any]] = None,
-) -> Dict[str, Any]:
+    current: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """One sentence (and, on a correction, the draft so far) -> a job's fields.
 
     Raises `DraftUnavailable` when this machine has no model handle, and `DraftInvalid` when the reply is not a usable
