@@ -808,6 +808,40 @@ def _config_path() -> Any:
 		return None
 
 
+def _write_env_setting(key: str, value: str) -> bool:
+	"""Write one FAMILIAR_* setting into this profile's own `.env`, where a gateway started from a shell reads it.
+
+	The env-shaped name and not `platforms.familiar.extra.<key>`, and the difference is measured rather than stylistic:
+	at gateway config load the plugin's `env_enablement_fn` seeds `extra` from these very env vars and the gateway
+	commits that seed ON TOP of the configured block - so an `extra.url` written here is silently replaced by the
+	default, and the machine dials its own loopback while the config appears to say otherwise.
+
+	Only this profile's own `.env`, and only this key: whatever else is in the file is left exactly as it was.
+	"""
+	path = _config_path()
+
+	if path is None:
+		return False
+
+	env = path.parent / ".env"
+
+	try:
+		lines = env.read_text(encoding="utf-8").splitlines() if env.exists() else []
+		kept = [line for line in lines if not re.match(rf"\s*{re.escape(key)}\s*=", line)]
+		kept.append(f"{key}={value}")
+
+		written = env.with_name(".env.familiar-tmp")
+		written.write_text("\n".join(kept) + "\n", encoding="utf-8")
+		env.replace(written)
+		logger.info("[familiar] this profile's .env now holds %s", key)
+
+		return True
+	except Exception as error:  # noqa: BLE001 - a setting this cannot write is not a reason to stop
+		logger.warning("[familiar] could not write %s into this profile's .env: %s", key, error)
+
+		return False
+
+
 def _write_config_extra(updates: dict[str, str]) -> bool:
 	"""Write settings into this profile's own `platforms.familiar.extra`, the way a restarted gateway reads them.
 

@@ -102,7 +102,12 @@ def pair_command(args: argparse.Namespace) -> int:
         # The address is the one thing only the reader has: the machine cannot know WHICH Familiar it is being added
         # to. Written here rather than by a separate `config set`, which is one fewer command to explain - and the
         # write goes into this profile's own config, where a restarted gateway reads it.
-        if not adapter._write_config_extra({"url": address}):
+        # NOT `platforms.familiar.extra.url`, measured: at gateway config load the plugin's `env_enablement_fn`
+        # seeds `extra` from the FAMILIAR_* env vars and the gateway commits that seed ON TOP of the configured
+        # block, so an `extra.url` set here is silently replaced by the default (http://127.0.0.1:3100) and the
+        # machine dials its own loopback while the setting looks right. The env-shaped name is the spelling that
+        # survives, and it is the one the machine's own `config set FAMILIAR_URL` writes.
+        if not adapter._write_env_setting("FAMILIAR_URL", address):
             print(f"Could not write the address into {profile}'s config. Is Hermes configured for this profile?")
 
             return 1
