@@ -79,7 +79,11 @@ os.environ["FAMILIAR_URL"] = URL
 os.environ["FAMILIAR_TOKEN"] = "tok_abc123"
 os.environ["FAMILIAR_INSTANCE"] = "homelab"
 
-import adapter  # noqa: E402
+import argparse
+import time
+
+import adapter
+import familiar_cli  # noqa: E402
 import answers  # noqa: E402
 from gateway.config import Platform, PlatformConfig  # noqa: E402
 from gateway.platform_registry import PlatformEntry, platform_registry  # noqa: E402
@@ -169,12 +173,16 @@ class Ctx:
     def __init__(self):
         self.kwargs = None
         self.aux_tasks = []
+        self.cli_commands = []
 
     def register_platform(self, **kwargs):
         self.kwargs = kwargs
 
     def register_auxiliary_task(self, key, **kwargs):
         self.aux_tasks.append({"key": key, **kwargs})
+
+    def register_cli_command(self, **kwargs):
+        self.cli_commands.append(kwargs)
 
     llm = fake_llm
 
@@ -183,6 +191,40 @@ ctx = Ctx()
 adapter.register(ctx)
 kwargs = ctx.kwargs or {}
 check("registers the platform 'familiar'", kwargs.get("name") == "familiar", str(kwargs.get("name")))
+command = next((c for c in ctx.cli_commands if c.get("name") == "familiar"), None)
+check(
+    "registers `hermes familiar`, so a machine pairs with one command rather than a paragraph of shell",
+    command is not None,
+    str([c.get("name") for c in ctx.cli_commands]),
+)
+check(
+    "the command hands its subcommands to argparse, which is how `pair` exists at all",
+    callable((command or {}).get("setup_fn")) and callable((command or {}).get("handler_fn")),
+    f"setup_fn={type((command or {}).get('setup_fn')).__name__} handler_fn={type((command or {}).get('handler_fn')).__name__}",
+)
+check(
+    "an action it does not have says so instead of doing something else",
+    familiar_cli.familiar_command(argparse.Namespace(familiar_action="nonsense")) == 2,
+    "exit code names the usage error",
+)
+# The wait is the whole reason the command exists, so it is checked against a real socket rather than mocked: a
+# closed port is the ordinary state of a restarting gateway, and this is what has to report it as not-yet-yet.
+_with_a_listening_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+_with_a_listening_socket.bind(("127.0.0.1", 0))
+_with_a_listening_socket.listen(1)
+_open_port = _with_a_listening_socket.getsockname()[1]
+check(
+    "waits out a gateway that is not up yet, rather than reporting a refusal as an answer",
+    familiar_cli._wait_for_port("127.0.0.1", _open_port, time.monotonic() + 2.0) is True,
+    "a listening port is what the wait returns on",
+)
+_with_a_listening_socket.close()
+check(
+    "and gives up at its deadline when nothing ever listens, which is a different thing to tell a reader",
+    familiar_cli._wait_for_port("127.0.0.1", _open_port, time.monotonic() + 1.0) is False,
+    "the closed port is refused until the deadline",
+)
+
 check(
     "declares the cron delivery env var, which is what makes `deliver: familiar` legal",
     kwargs.get("cron_deliver_env_var") == "FAMILIAR_HOME_CHANNEL",
@@ -2720,7 +2762,7 @@ async def _wait_finds_the_token():
     try:
         await _asyncio.wait_for(live._wait_for_token(), timeout=5)
         return True
-    except _asyncio.TimeoutError:
+    except TimeoutError:
         return False
     finally:
         adapter._load_token = real_load

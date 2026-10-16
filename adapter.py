@@ -45,7 +45,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, UTC
 from pathlib import Path
 from typing import Any
 
@@ -808,23 +808,20 @@ def _config_path() -> Any:
 		return None
 
 
-def _write_config_token(token: str) -> None:
-	"""Write a token this machine was GIVEN into this profile's own config.
+def _write_config_extra(updates: dict[str, str]) -> bool:
+	"""Write settings into this profile's own `platforms.familiar.extra`, the way a restarted gateway reads them.
 
-	Why here, and not only in the state: the state is what a live gateway presents, and the config is what a RESTARTED
-	one falls back to. Only the state was ever written, so every restart went back to the token in the config - which,
-	after a machine is deleted and added again, is the one Familiar already refused. Measured: a machine paired
-	successfully, reported its port, and then revoked itself on the next restart, pairing again with a token it had
-	been given and still held.
+	Written as a file rather than through the CLI because the value must not travel through a command line, and
+	replaced rather than edited so a half-written config can never be left behind for a gateway to read at startup.
+	Read back before it becomes the config: a gateway that finds YAML it cannot parse does not start.
 
-	Written as a file rather than through the CLI because the value must not travel through a command line, and replaced
-	rather than edited so a half-written config can never be left behind for a gateway to read at startup. The value is
-	never logged: a token in a log is a token leaked.
+	Returns whether the write landed, so a caller that needs it (the pairing command, setting the address the machine
+	dials) can say so rather than carrying on against a config that did not change.
 	"""
 	path = _config_path()
 
 	if path is None or not path.exists():
-		return
+		return False
 
 	try:
 		import yaml
@@ -832,37 +829,58 @@ def _write_config_token(token: str) -> None:
 		config = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 		if not isinstance(config, dict):
-			return
+			return False
 
 		platforms = config.setdefault("platforms", {})
 		familiar = platforms.setdefault("familiar", {}) if isinstance(platforms, dict) else {}
 
 		if not isinstance(familiar, dict):
-			return
+			return False
 
 		extra = familiar.setdefault("extra", {})
 
-		if not isinstance(extra, dict) or extra.get("token") == token:
-			return
+		if not isinstance(extra, dict):
+			return False
 
-		extra["token"] = token
+		if all(extra.get(key) == value for key, value in updates.items()):
+			return True
+
+		extra.update(updates)
 
 		written = path.with_name(f".{path.name}.familiar-tmp")
 		written.write_text(yaml.safe_dump(config, sort_keys=False, allow_unicode=True), encoding="utf-8")
 
-		# Read it back before it becomes the config: a gateway that finds YAML it cannot parse does not start.
 		reloaded = yaml.safe_load(written.read_text(encoding="utf-8")) or {}
-		kept = (((reloaded.get("platforms") or {}).get("familiar") or {}).get("extra") or {}).get("token")
+		kept = (((reloaded.get("platforms") or {}).get("familiar") or {}).get("extra") or {})
 
-		if kept != token:
+		if any(kept.get(key) != value for key, value in updates.items()):
 			written.unlink(missing_ok=True)
 			logger.warning("[familiar] the profile's config was left alone: the rewritten copy did not read back")
-			return
+
+			return False
 
 		os.replace(written, path)
-		logger.info("[familiar] this profile's config now holds the token Familiar issued, so a restart keeps it")
+
+		# The keys are named, never the values: one of these is a token, and a token in a log is a token leaked.
+		logger.info("[familiar] this profile's config now holds %s", ", ".join(sorted(updates)))
+
+		return True
 	except Exception as error:  # noqa: BLE001 - a config this cannot write is not a reason to stop delivering
-		logger.warning("[familiar] could not write the token into this profile's config: %s", error)
+		logger.warning("[familiar] could not write settings into this profile's config: %s", error)
+
+		return False
+
+
+def _write_config_token(token: str) -> None:
+	"""Keep a token this machine was GIVEN in this profile's own config, where a restarted gateway looks.
+
+	Why here, and not only in the state: the state is what a live gateway presents, and the config is what a RESTARTED
+	one falls back to. Only the state was ever written, so every restart went back to the token in the config - which,
+	after a machine is deleted and added again, is the one Familiar already refused. Measured: a machine paired
+	successfully, reported its port, and then revoked itself on the next restart, pairing again with a token it had
+	been given and still held.
+	"""
+	_write_config_extra({"token": token})
 
 
 def _save_token(url: str, token: str) -> None:
@@ -1190,7 +1208,7 @@ def _payload(instance: str, target: str, content: str, metadata: dict[str, Any] 
 		"truncated": truncated,
 		"jobId": str(job_id) if job_id else None,
 		"jobName": _job_name(str(job_id)) if job_id else None,
-		"sentAt": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+		"sentAt": datetime.now(UTC).isoformat(timespec="seconds"),
 	}
 
 
@@ -2814,7 +2832,12 @@ async def _standalone_send(
 def register(ctx) -> None:
 	"""Plugin entry point, called once at startup.
 
-	Two things are declared here, and the second is the whole reason a reader never edits a config: the job draft asks
+	Three things are declared here. The command line is the one a reader meets first: pairing is what every other
+	part of this plugin depends on, and it is the one step that cannot be done from Familiar's side - the code
+	belongs to the machine. It is a command rather than a paragraph of shell because reading that code means waiting
+	out a gateway restart and knowing a port, and neither is the reader's business.
+
+	The other two, and the second is the whole reason a reader never edits a config: the job draft asks
 	a MODEL something, and Hermes gates that per plugin. Registering the auxiliary task IS the grant - a task key a
 	plugin registered itself is always allowed - and it gives the task its own entry in the machine's model picker, so
 	which model drafts a job is a choice in the UI with the machine's main model as the default.
@@ -2837,6 +2860,26 @@ def register(ctx) -> None:
 			description=_draft.DRAFT_TASK_DESCRIPTION,
 		)
 	_draft.set_llm(getattr(ctx, "llm", None))
+
+	# The command line: `hermes familiar pair`. Imported inside the function for the same reason draft.py is - the
+	# check suite loads these files flat and the package load does not - and registered only where the host HAS the
+	# API, so a machine whose Hermes predates it still gets its channel.
+	try:
+		from . import familiar_cli as _cli
+	except ImportError:  # pragma: no cover - the flat load the check suite uses
+		import familiar_cli as _cli
+
+	if hasattr(ctx, "register_cli_command"):
+		ctx.register_cli_command(
+			name="familiar",
+			help="Pair this machine with a Familiar, and read the code it is showing",
+			setup_fn=_cli.register_cli,
+			handler_fn=_cli.familiar_command,
+			description=(
+				"Familiar shows one code and waits for it to be typed. This reads it, waiting for a gateway that is "
+				"restarting first - so one command replaces the endpoint, the port and the timing."
+			),
+		)
 
 	ctx.register_platform(
 		name="familiar",
