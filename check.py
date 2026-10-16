@@ -2926,6 +2926,91 @@ with _tempfile3.TemporaryDirectory() as _t3:
           "dev_one" in _prod_with_dev_current, f"prod sees {_prod_with_dev_current}")
     adapter._profile_key = _real_profile_key
 
+# ----------------------------------------------------------------------------------------------------------------
+# Taking a profile that belongs to somebody else, and the port a deleted profile leaves behind.
+print("\nactivating onto a profile another Familiar already has")
+
+import tempfile as _tempfile4, pathlib as _pl4, types as _types2
+
+_real_list_profiles = adapter._list_profiles
+_real_run_hermes = adapter._run_hermes
+_real_install_provenance = adapter._install_provenance
+_real_state_home = adapter._state_home
+
+
+def _bare_adapter(url="https://mine.example"):
+    made = adapter.FamiliarAdapter.__new__(adapter.FamiliarAdapter)
+    made._url = url
+    made._token = "presented-token"
+    made._ingress_token = ""
+    return made
+
+
+with _tempfile4.TemporaryDirectory() as _t4:
+    _root = _pl4.Path(_t4)
+    _other = _root / "taken"
+    _other.mkdir()
+    (_other / "config.yaml").write_text(
+        "platforms:\n  familiar:\n    extra:\n      url: https://other.example\n", encoding="utf-8")
+
+    _free = _root / "free_one"
+    _free.mkdir()
+
+    _calls = []
+
+    def _stub_run(argv, timeout=300):
+        _calls.append(argv)
+        return 0, ""
+
+    adapter._list_profiles = lambda: [
+        _types2.SimpleNamespace(name="taken", path=str(_other), is_default=False, gateway_running=True),
+        _types2.SimpleNamespace(name="free_one", path=str(_free), is_default=False, gateway_running=True),
+    ]
+    adapter._run_hermes = _stub_run
+    adapter._install_provenance = lambda: ("https://github.com/example/plugin.git", "0" * 40)
+
+    _taken = asyncio.new_event_loop().run_until_complete(_bare_adapter()._channel_activate({"profile": "taken"}))
+
+    check("activating a profile pointed at ANOTHER Familiar is refused",
+          "other.example" in str(_taken.get("error", "")), str(_taken)[:150])
+    check("and the refusal happens BEFORE anything is installed on it",
+          not any("install" in " ".join(c) for c in _calls), str(_calls)[:150])
+
+    _calls.clear()
+    asyncio.new_event_loop().run_until_complete(_bare_adapter()._channel_activate({"profile": "free_one"}))
+
+    check("while a profile pointed at nothing is still activated, which is the whole point of the action",
+          any("install" in " ".join(c) for c in _calls), str(_calls)[:150])
+
+adapter._list_profiles = _real_list_profiles
+adapter._run_hermes = _real_run_hermes
+adapter._install_provenance = _real_install_provenance
+
+print("\na deleted profile takes its ingress port with it")
+
+with _tempfile4.TemporaryDirectory() as _t5:
+    adapter._state_home = lambda: _pl4.Path(_t5)
+
+    with adapter._state_change(writes_pairing=True) as _st:
+        _st["pairings"] = {"https://mine.example": {"token": "kept"}}
+        _st["ingress"] = {"default": 8644, "gone_one": 8645}
+
+    adapter._forget_ingress("gone_one")
+
+    _after = adapter._read_raw()
+
+    check("the deleted profile's port is gone", "gone_one" not in (_after.get("ingress") or {}), str(_after))
+    check("the machine's own profile keeps its port", (_after.get("ingress") or {}).get("default") == 8644, str(_after))
+    check("and the pairing in the same file is untouched, because one section is not the other",
+          (_after.get("pairings") or {}).get("https://mine.example", {}).get("token") == "kept", str(_after))
+
+    adapter._forget_ingress("default")
+
+    check("a section with nothing left in it goes entirely",
+          "ingress" not in adapter._read_raw(), str(adapter._read_raw()))
+
+adapter._state_home = _real_state_home
+
 print("\nwhat a machine says when it asks to be paired")
 
 import asyncio as _aio2

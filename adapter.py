@@ -549,6 +549,15 @@ def _url_in(home: Path) -> str:
 
 	return _backend_key(value or _env_value(home, "FAMILIAR_URL"))
 
+def _home_of(name: str) -> Optional[Path]:
+	"""One profile's home by name, or None when this machine has no such profile."""
+	for info in _list_profiles():
+		if str(getattr(info, "name", "") or "") == name:
+			return Path(getattr(info, "path", "") or "")
+
+	return None
+
+
 def _profiles_report(infos: List[Any], backend: str = "") -> List[Dict[str, Any]]:
 	"""What Familiar is told about this machine's profiles, one entry each.
 
@@ -754,6 +763,31 @@ def _save_ingress_port(profile: str, port: int) -> None:
 		ports = dict(ports) if isinstance(ports, dict) else {}
 		ports[profile] = int(port)
 		state["ingress"] = ports
+
+
+def _forget_ingress(profile: str) -> None:
+	"""Drop one profile's remembered ingress port, if it has one.
+
+	Deleting a profile used to leave the port it took behind, and the map then named a profile the machine no longer
+	has - read as fact by anyone opening the file, which is enough on a map whose whole job is to be the record of what
+	took which port. The section goes when the last profile does, so an empty machine does not keep an empty shell.
+	"""
+	with _state_change() as state:
+		if state is None:
+			return
+
+		ports = state.get("ingress")
+
+		if not isinstance(ports, dict) or profile not in ports:
+			return
+
+		ports = dict(ports)
+		ports.pop(profile, None)
+
+		if ports:
+			state["ingress"] = ports
+		else:
+			state.pop("ingress", None)
 
 
 def _entry_for(url: str) -> Dict[str, Any]:
@@ -1732,6 +1766,9 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		if code != 0:
 			return {"error": _answer_line(output) or f"hermes profile delete exited {code}"}
 
+		# Its ingress port goes with it. Only on the way out: a delete that failed leaves a profile that still exists.
+		_forget_ingress(name)
+
 		return {"profile": name, "deleted": True}
 
 	async def _channel_profiles(self, frame: Dict[str, Any]) -> Dict[str, Any]:
@@ -1765,6 +1802,23 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 
 		if profile == _profile_key():
 			return {"error": "that is this profile: the channel is already here"}
+
+		# A profile already pointed at ANOTHER Familiar is not ours to take. `default` is the machine's own profile
+		# and belongs to whoever set the machine up; a named one is where a second Familiar lives. Writing our URL
+		# over it would not move the profile so much as strand it: that other Familiar keeps a token nothing dials,
+		# and its instance goes quiet with no error anywhere - the profile looks activated from here and unreachable
+		# from there. Refused rather than warned, because a warning here is read after the machine has gone dark.
+		target_home = _home_of(profile)
+		target_url = _url_in(target_home) if target_home else ""
+
+		if target_url and target_url != _backend_key(self._url):
+			return {
+				"error": (
+					f"`{profile}` is pointed at {target_url}, which is another Familiar: activating it here would "
+					"take it from that one. Use a profile that is free, or move it deliberately with "
+					f"`hermes -p {profile} config set FAMILIAR_URL {self._url}`"
+				)
+			}
 
 		source, revision = _install_provenance()
 
