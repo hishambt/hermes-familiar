@@ -92,6 +92,10 @@ MOVE_TRIES = 20
 #: it - slower than a setting, and bounded so a machine that hangs does not hang the answer.
 GATEWAY_INSTALL_TIMEOUT_S = 180
 
+# Hermes' exit code for a request its own configuration refuses permanently (EX_CONFIG). The one this file reads is the
+# profile-multiplexer refusal, which is not an error: the default gateway already serves that profile.
+GATEWAY_MULTIPLEXER_EXIT_CODE = 78
+
 #: The only keys a PAIRING entry may hold. A sibling section of the same file - the ports - must never end up
 #: inside one: an entry carrying an unrelated key still looks like a pairing that exists, so clearing it would
 #: leave the entry behind and the machine would never read as unpaired again.
@@ -1918,6 +1922,20 @@ class FamiliarAdapter(FamiliarAnswerRoutes, BasePlatformAdapter):
 		# which is exactly the state the reader just asked to leave.
 		service_code, service_output = await asyncio.to_thread(
 			_run_hermes, ["-p", profile, "gateway", "install", "--start-now"], GATEWAY_INSTALL_TIMEOUT_S)
+
+		# A machine whose DEFAULT gateway multiplexes its profiles has no per-profile service to install. Hermes
+		# refuses the request with exit 78 before any service manager is touched, because a second gateway would
+		# double-bind this profile's platforms - and that refusal is not a failure: the multiplexer already serves
+		# this profile, and it resolves a routed profile's config on every turn, so these settings land without a
+		# restart. Read as a failure it would tell a reader their profile is dead when it is running.
+		if service_code == GATEWAY_MULTIPLEXER_EXIT_CODE and "multiplexer" in service_output.lower():
+			return {
+				"profile": profile,
+				"installed": revision,
+				"registered": doctor_code == 0 and "ERROR" not in doctor_output.upper(),
+				"gateway": True,
+				"gatewayDetail": "served by this machine's default gateway",
+			}
 
 		# RESTARTED, and not merely started. The settings above are read at STARTUP, so a gateway that is already
 		# running - which is exactly what a profile activated a second time has - keeps whatever it read then, and

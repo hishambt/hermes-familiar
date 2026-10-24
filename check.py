@@ -2166,6 +2166,49 @@ check(
     str(_install_argv[:4]),
 )
 
+# A machine that runs its default gateway as a PROFILE MULTIPLEXER has no per-profile service to install: Hermes
+# refuses with exit 78 before any service manager is touched, because a second gateway would double-bind that
+# profile's platforms. That refusal is an answer, not a failure - the multiplexer already serves the profile and
+# resolves its config per turn - so it has to read as running, and nothing may be restarted.
+async def _activate_under_a_multiplexer():
+    adapter._install_provenance = lambda: ("https://github.com/hishambt/hermes-familiar.git", "a" * 40)
+    calls: list = []
+
+    def _multiplexed(argv, timeout=300):
+        calls.append(list(argv))
+
+        if "gateway" in argv:
+            return 78, "The default gateway is running as a profile multiplexer and already serves profile 'coder'."
+
+        return (0, "✓ Installed") if "install" in argv else (0, "Plugin Doctor: OK")
+
+    adapter._run_hermes = _multiplexed
+
+    answer = await live._channel_activate({"profile": "coder"})
+
+    return answer, calls
+
+
+_served, _served_calls = asyncio.run(_activate_under_a_multiplexer())
+adapter._install_provenance = _provenance_was
+adapter._run_hermes = _run_was
+
+check(
+    "a profile the default multiplexer serves is RUNNING, not a start that failed",
+    _served.get("gateway") is True,
+    str(_served),
+)
+check(
+    "and the answer says so in the machine's own terms",
+    _served.get("gatewayDetail") == "served by this machine's default gateway",
+    str(_served.get("gatewayDetail")),
+)
+check(
+    "and nothing is restarted, because there is no per-profile service to restart",
+    not any("restart" in argv for argv in _served_calls),
+    str(_served_calls),
+)
+
 # Where the interpreter and the module come from, with the spawn stubbed: `sys.executable -m hermes_cli.main` and
 # never a `hermes` from PATH, which may be a profile's own wrapper - the class of mistake this action exists to avoid.
 import types  # noqa: E402 - a script, and this belongs with the check that uses it
